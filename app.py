@@ -51,6 +51,9 @@ with st.sidebar:
         max_retries = st.slider("每步最多重试次数", 0, 3, 2)
     else:
         max_tool_calls = st.slider("工具调用次数上限", 5, 25, 15, help="防止模型反复调用工具、陷入死循环")
+        tool_source = st.radio("工具来源", ["内置工具箱", "MCP 服务器"], horizontal=True,
+                               help="MCP 服务器：Agent 作为 MCP 客户端，连接 mcp_servers.json 里配置的服务器，"
+                                    "读取它们提供的工具。只读工具直接开放，会改东西的工具要在配置里允许。")
         st.caption("工具权限：只读工具直接执行；运行代码先过安全检查再在独立进程执行；"
                    "读写文件、联网的工具不提供。")
     use_review = st.checkbox("独立审查报告", value=True,
@@ -162,7 +165,7 @@ def show_answer(run: RunResult, idx: int) -> None:
         st.success("自动校验通过：报告中的数字都能在计算结果中找到出处。")
     show_review(run)
     st.markdown(run.report)
-    if run.mode == "tools":
+    if run.mode in ("tools", "mcp"):
         show_tool_calls(run)
     with st.expander(f"查看分析过程（{len(run.steps)} 步，用时 {run.seconds} 秒）"):
         for rec in run.steps:
@@ -215,7 +218,8 @@ if question:
         reviewer = OpenAICompatLLM(rcfg) if rcfg else None
         if mode == "工具调用":
             agent = ToolCallingAgent(llm, max_tool_calls=max_tool_calls,
-                                     reviewer=reviewer, review=use_review, checkpoints=CheckpointStore())
+                                     reviewer=reviewer, review=use_review, checkpoints=CheckpointStore(),
+                                     tool_source="mcp" if tool_source == "MCP 服务器" else "builtin")
         else:
             agent = DataAnalystAgent(llm, max_retries=max_retries,
                                      reviewer=reviewer, review=use_review, checkpoints=CheckpointStore())
@@ -259,6 +263,11 @@ if question:
                     st.write("🧑‍⚖️ 独立审查员正在检查结论是否与计算结果矛盾")
                 elif kind == "review" and payload.revised:
                     st.write("　↻ 审查发现严重矛盾，已让 AI 修改报告")
+                elif kind == "mcp_connected":
+                    st.write(f"🔌 已连接 MCP 服务器，获得 {len(payload['tools'])} 个工具："
+                             + "、".join(payload["tools"]))
+                    if payload["hidden"]:
+                        st.write("　🔒 未开放：" + "；".join(f"{k}（{v}）" for k, v in payload["hidden"].items()))
                 elif kind == "resume":
                     st.write(f"💾 找到上次的存档：已完成 {payload['done']} 步，从断点继续")
                 elif kind == "preferences":

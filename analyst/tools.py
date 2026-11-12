@@ -84,6 +84,14 @@ class ToolBox:
         self.loaded_skills: list[str] = []
         self.cleaned = False
 
+    @property
+    def rows(self) -> int:
+        """当前数据行数（清洗后会变少）。MCPToolBox 也有同名属性，Agent 不用关心工具从哪来。"""
+        return len(self.df)
+
+    def close(self) -> None:
+        """内置工具箱没有需要关闭的连接；和 MCPToolBox 保持同样的用法。"""
+
     def schemas(self) -> list[dict]:
         """只把允许的工具告诉模型。"""
         return [t.schema() for t in self.tools.values() if t.level in self.allowed]

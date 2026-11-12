@@ -25,12 +25,14 @@ MCP（Model Context Protocol，模型上下文协议）是一个“通用插座�
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 import pandas as pd
 from mcp.server.mcpserver import MCPServer
-from mcp.types import ToolAnnotations
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 from .config import ROOT
 from .profiler import load_table, profile, profile_numbers, profile_to_text
@@ -100,6 +102,13 @@ def _resolve_data_path(path: str | None) -> Path:
     return p
 
 
+def _ok_or_raise(out) -> str:
+    """失败时抛 ToolError：客户端收到的结果会带 is_error 标记（MCP 协议里表示“工具执行失败”的标准方式）。"""
+    if not out.ok:
+        raise ToolError(out.text)
+    return out.text
+
+
 def build_server(session: Session | None = None) -> MCPServer:
     s = session or Session()
     mcp = MCPServer(name="ecommerce-analyst", title="电商经营分析工具箱", instructions=INSTRUCTIONS)
@@ -110,7 +119,7 @@ def build_server(session: Session | None = None) -> MCPServer:
         try:
             name = s.load(path or None)
         except ValueError as e:
-            return f"加载失败：{e}"
+            raise ToolError(f"加载失败：{e}") from e
         return f"已加载 {name}：{len(s.raw)} 行 × {s.raw.shape[1]} 列。\n\n" + profile_to_text(profile(s.raw), s.raw)
 
     @mcp.tool(annotations=READ_ONLY)
@@ -123,14 +132,14 @@ def build_server(session: Session | None = None) -> MCPServer:
     @mcp.tool(annotations=READ_ONLY)
     def preview_data(n: int = 5, columns: list[str] | None = None) -> str:
         """预览当前数据的前 n 行（1～20），可只看指定的列。"""
-        return s.require().call("preview_data", {"n": n, "columns": columns}).text
+        return _ok_or_raise(s.require().call("preview_data", {"n": n, "columns": columns}))
 
     @mcp.tool(annotations=READ_ONLY)
     def describe_column(column: str) -> str:
         """查看某一列：类型、缺失、不同取值；数字列给分位数，文字列给最常见取值。"""
         out = s.require().call("describe_column", {"column": column})
         s.extra_numbers += out.numbers
-        return out.text
+        return _ok_or_raise(out)
 
     @mcp.tool(annotations=READ_ONLY)
     def list_skills() -> str:
@@ -140,18 +149,26 @@ def build_server(session: Session | None = None) -> MCPServer:
     @mcp.tool(annotations=READ_ONLY)
     def load_skill(name: str) -> str:
         """加载一个 Skill 的规则全文（如“数据清洗”“电商指标”），之后计算和写报告都要遵守。"""
-        return s.require().call("load_skill", {"name": name}).text
+        return _ok_or_raise(s.require().call("load_skill", {"name": name}))
 
     @mcp.tool(annotations=RUN_CODE)
-    def run_python(code: str, purpose: str = "") -> str:
+    def run_python(code: str, purpose: str = "") -> CallToolResult:
         """运行一段 pandas 分析代码。已有 df、pd、np、plt；结果写进字典 result：
         result['metrics']={'指标名': 数字}、result['tables']={'表名': DataFrame}、result['notes']='说明'；
         清洗时把清洗后的完整数据放进 result['cleaned_df']，之后的 df 自动变成清洗后的数据。
         代码先过安全检查（只能导入 pandas/numpy/matplotlib/math/statistics/datetime/re，不能读写文件、联网），再在独立进程中运行，超时 60 秒。"""
-        out = s.require().call("run_python", {"code": code, "purpose": purpose})
+        box = s.require()
+        out = box.call("run_python", {"code": code, "purpose": purpose})
         if out.ok and out.exec_result is not None:
             s.results.append(out.exec_result)
-        return out.text
+        text = _ok_or_raise(out)
+        # 文字给模型看；结构化数据（指标、表格）给程序用，客户端可以据此核对数字
+        r = out.exec_result
+        structured = {"metrics": r.metrics, "notes": r.notes, "rows": len(box.df), "cleaned": box.cleaned,
+                      "tables": {k: json.loads(v.reset_index().to_json(orient="split", date_format="iso",
+                                                                       force_ascii=False))
+                                 for k, v in r.tables.items()}}
+        return CallToolResult(content=[TextContent(type="text", text=text)], structured_content=structured)
 
     @mcp.tool(annotations=READ_ONLY)
     def verify_report(report: str) -> str:

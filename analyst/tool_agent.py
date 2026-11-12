@@ -37,8 +37,12 @@ from .validator import check_step, numbers_from_results
 class ToolCallingAgent:
     def __init__(self, llm: ToolLLM, max_tool_calls: int = 15, timeout: int = 60,
                  skills: list[Skill] | None = None, allowed_levels: set[str] | None = None,
-                 reviewer=None, review: bool = True, checkpoints: CheckpointStore | None = None):
+                 reviewer=None, review: bool = True, checkpoints: CheckpointStore | None = None,
+                 tool_source: str = "builtin", mcp_specs=None):
         self.llm = llm
+        # 工具来源：builtin = 内置工具箱（tools.py）；mcp = 通过 MCP 协议连接 mcp_servers.json 里的服务器
+        self.tool_source = tool_source
+        self.mcp_specs = mcp_specs        # 测试时可以直接传入服务器，不读配置文件
         self.checkpoints = checkpoints    # 传入后：每轮工具调用后存盘，失败后从断点继续
         self.reviewer = reviewer or llm   # 审查员可以换成另一个模型
         self.review = review
@@ -62,7 +66,19 @@ class ToolCallingAgent:
         prof = profile(df)
         ptext = profile_to_text(prof, df)
         emit("profile", ptext)
-        box = ToolBox(df, self.skills, timeout=self.timeout, allowed_levels=self.allowed_levels)
+        if self.tool_source == "mcp":
+            from .mcp_client import MCPToolBox
+            box = MCPToolBox(df, self.mcp_specs)
+            emit("mcp_connected", {"tools": [n for n in box.tools if n != "submit_report"],
+                                   "hidden": box.hidden})
+        else:
+            box = ToolBox(df, self.skills, timeout=self.timeout, allowed_levels=self.allowed_levels)
+        try:
+            return self._loop(df, question, emit, log, t0, prof, ptext, box, history, preferences)
+        finally:
+            box.close()
+
+    def _loop(self, df, question, emit, log, t0, prof, ptext, box, history, preferences) -> RunResult:
         skill_list = "\n".join(f"- {s.name}：{s.description}" for s in self.skills) or "（无）"
         messages = [
             {"role": "system", "content": prompts.TOOL_AGENT_SYSTEM},
@@ -81,7 +97,7 @@ class ToolCallingAgent:
         report, nudged, used = "", False, 0
 
         # 任务恢复：有存档就还原对话记录、已完成步骤和工具箱状态，接着上次的对话继续
-        store = self.checkpoints
+        store = self.checkpoints if self.tool_source != "mcp" else None   # MCP 模式：服务器状态存不进本地存档
         tid = task_id("tools", question, df, history, preferences) if store else ""
         saved = store.load(tid) if store else None
         if saved:
@@ -125,7 +141,7 @@ class ToolCallingAgent:
                 level = box.tools[name].level if name in box.tools else "unknown"
                 emit("tool_call", {"n": used, "name": name, "level": LEVEL_NAMES.get(level, "不存在"),
                                    "args": _short_args(args)})
-                rows_before = len(box.df)
+                rows_before = box.rows
                 out = box.call(name, args)
                 trace.append({"n": used, "name": name, "level": LEVEL_NAMES.get(level, "不存在"),
                               "args": _short_args(args), "ok": out.ok, "result": out.text[:500]})
@@ -139,7 +155,7 @@ class ToolCallingAgent:
                     emit("skills", [(args.get("name"), "模型调用 load_skill 加载")])
                 elif name == "run_python" and out.exec_result is not None:
                     open_step = self._record_step(open_step, steps, args, out, rows_before,
-                                                   len(box.df), emit)
+                                                   box.rows, emit)
                 elif name == "submit_report" and out.ok and level == FINISH:
                     report, finished = str(args.get("report", "")), True
             if finished:
@@ -153,7 +169,7 @@ class ToolCallingAgent:
                 break
 
         known = profile_numbers(prof) + numbers_from_results([s.result for s in steps if s.result])
-        known += extra_numbers + [float(len(box.df))]
+        known += extra_numbers + [float(box.rows)]
         report, unverified, review = check_and_review(
             report.strip(), known, question,
             review_context(ptext, format_results(steps), read_outputs), self.llm,
@@ -164,7 +180,8 @@ class ToolCallingAgent:
         return RunResult(question, prof, plan, steps, report.strip(), unverified, log,
                          round(time.time() - t0, 1),
                          [(n, "模型调用 load_skill 加载") for n in box.loaded_skills],
-                         mode="tools", tool_calls=trace, review=review, resumed_steps=resumed)
+                         mode="mcp" if self.tool_source == "mcp" else "tools", tool_calls=trace,
+                         review=review, resumed_steps=resumed)
 
     @staticmethod
     def _record_step(open_step, steps, args, out, rows, rows_after, emit) -> StepRecord | None:

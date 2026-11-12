@@ -5,6 +5,7 @@
     python evals/run_eval.py --only C01 C07  # 只跑指定题目
     python evals/run_eval.py --label 加入评测前   # 给这次评测起个名字，写进报告
     python evals/run_eval.py --mode tools        # 评测工具模式（默认 plan：规划-执行模式）
+    python evals/run_eval.py --mode mcp          # 工具模式，但工具通过 MCP 服务器调用
 
 每道题在 evals/cases.json 里有若干“检查标准”，全部通过才算这道题通过。
 结果保存到 docs/评测报告/，每次一份 Markdown（给人看）和一份 JSON（给程序对比）。
@@ -202,8 +203,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", nargs="*", help="只跑这些题号")
     ap.add_argument("--label", default="评测", help="这次评测的名字")
-    ap.add_argument("--mode", choices=["plan", "tools"], default="plan",
-                    help="plan：规划-执行模式；tools：工具调用模式")
+    ap.add_argument("--mode", choices=["plan", "tools", "mcp"], default="plan",
+                    help="plan：规划-执行模式；tools：工具调用模式；mcp：工具调用模式，但工具经 MCP 服务器调用")
     args = ap.parse_args()
 
     spec = json.loads(CASES.read_text(encoding="utf-8"))
@@ -215,9 +216,10 @@ def main() -> None:
     from analyst.config import get_reviewer_config
     rcfg = get_reviewer_config(cfg)
     reviewer = OpenAICompatLLM(rcfg) if rcfg else None
-    if args.mode == "tools":
+    if args.mode in ("tools", "mcp"):
         from analyst.tool_agent import ToolCallingAgent
-        agent = ToolCallingAgent(OpenAICompatLLM(cfg), reviewer=reviewer)
+        agent = ToolCallingAgent(OpenAICompatLLM(cfg), reviewer=reviewer,
+                                 tool_source="mcp" if args.mode == "mcp" else "builtin")
     else:
         agent = DataAnalystAgent(OpenAICompatLLM(cfg), reviewer=reviewer)
 

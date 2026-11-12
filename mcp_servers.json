@@ -1,0 +1,24 @@
+{
+  "说明": "工具模式选择“MCP 服务器”作为工具来源时，Agent 会连接这里列出的服务器。command 写 python 表示用当前虚拟环境的 Python；相对路径相对项目根目录。hide_tools：不开放给模型的工具（load_data 由 Agent 统一调用；analyze 会造成套娃；verify_report 是给 Claude 等外部客户端用的，本项目 Agent 自己会核对数字和独立审查，开放它会让模型反复核对、绕圈）。allow_tools：允许开放的非只读工具。code_tools：运行代码的工具，结果整理成“步骤”。",
+  "servers": {
+    "ecommerce-analyst": {
+      "command": "python",
+      "args": [
+        "mcp_server.py"
+      ],
+      "data_tool": "load_data",
+      "hide_tools": [
+        "analyze",
+        "load_data",
+        "verify_report"
+      ],
+      "allow_tools": [
+        "run_python",
+        "reset_data"
+      ],
+      "code_tools": [
+        "run_python"
+      ]
+    }
+  }
+}

@@ -15,7 +15,7 @@ from analyst.agent import DataAnalystAgent  # noqa: E402
 from analyst.llm import FakeLLM, extract_code, extract_json  # noqa: E402
 from analyst.profiler import profile, profile_to_text  # noqa: E402
 from analyst.sandbox import run_code, static_check  # noqa: E402
-from analyst.validator import verify_report_numbers  # noqa: E402
+from analyst.validator import numbers_from_results, verify_report_numbers  # noqa: E402
 from make_sample_data import make  # noqa: E402
 
 
@@ -643,3 +643,123 @@ def test_mcp_server_starts_over_stdio():
             return names, text
     names, text = asyncio.run(go())
     assert "run_python" in names and "数据清洗" in text
+
+
+# ---------- MCP 客户端：Agent 通过 MCP 使用工具 ----------
+from analyst.mcp_client import MCPToolBox, ServerSpec, load_config  # noqa: E402
+
+
+def _external_server():
+    """模拟一个“别人写的” MCP 服务器：一个只读工具、一个会删东西的工具、一个没标注的工具。"""
+    from mcp.server.mcpserver import MCPServer
+    from mcp.types import ToolAnnotations
+    srv = MCPServer("external")
+
+    @srv.tool(annotations=ToolAnnotations(read_only_hint=True))
+    def exchange_rate(currency: str) -> str:
+        """查询汇率（只读）。"""
+        return f"{currency} 汇率 7.12"
+
+    @srv.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True))
+    def delete_orders(order_id: str) -> str:
+        """删除订单（危险）。"""
+        return "已删除"
+
+    @srv.tool()
+    def no_annotation(x: str) -> str:
+        """没有任何标注的工具。"""
+        return x
+    return srv
+
+
+def test_mcp_toolbox_permissions_for_external_server(df):
+    box = MCPToolBox(df, [ServerSpec("external", _external_server())])
+    try:
+        names = [s["function"]["name"] for s in box.schemas()]
+        assert "exchange_rate" in names and "submit_report" in names
+        # 会改东西的、没标注只读的工具默认都不开放，强行调用也被拒绝
+        assert "delete_orders" not in names and "no_annotation" not in names
+        out = box.call("delete_orders", {"order_id": "1"})
+        assert not out.ok and "allow_tools" in out.text
+        out = box.call("exchange_rate", {"currency": "USD"})
+        assert out.ok and "7.12" in out.text and 7.12 in out.numbers
+    finally:
+        box.close()
+    # 在 allow_tools 里写明之后才开放
+    box = MCPToolBox(df, [ServerSpec("external", _external_server(), allow_tools=["delete_orders"])])
+    try:
+        assert box.call("delete_orders", {"order_id": "1"}).ok
+    finally:
+        box.close()
+
+
+def test_mcp_toolbox_with_own_server_over_stdio():
+    """真实场景：按 mcp_servers.json 启动自己的 MCP 服务器子进程，用示例数据。"""
+    from analyst.profiler import load_table
+    data = load_table(Path(__file__).resolve().parent.parent / "sample_data" / "模拟电商订单.csv")
+    box = MCPToolBox(data)
+    try:
+        names = set(box.tools)
+        assert {"run_python", "describe_column", "load_skill", "submit_report"} <= names
+        assert "analyze" not in names and "load_data" not in names      # 配置里隐藏
+        assert box.tools["run_python"].level == "exec" and box.tools["describe_column"].level == "read"
+        bad = box.call("run_python", {"code": "import os", "purpose": "危险"})
+        assert not bad.ok and "安全检查未通过" in bad.text               # 护栏在服务器那边照样生效
+        good = box.call("run_python", {"purpose": "清洗", "code":
+                        "result['cleaned_df'] = df.drop_duplicates()\nresult['notes'] = '去重'"})
+        assert good.ok and box.rows == 2000 and box.cleaned
+        assert box.call("load_skill", {"name": "电商指标"}).ok and box.loaded_skills == ["电商指标"]
+    finally:
+        box.close()
+
+
+def test_tool_agent_runs_through_mcp(df, monkeypatch):
+    import tempfile
+    from analyst.mcp_server import build_server
+    # 同一进程里连接自己的服务器时没有子进程环境变量可传，直接授权系统临时目录（MCPToolBox 把数据存在那里）
+    monkeypatch.setenv("ANALYST_DATA_DIR", tempfile.gettempdir())
+    spec = ServerSpec("own", build_server(), data_tool="load_data", hide_tools=["analyze", "load_data"],
+                      allow_tools=["run_python", "reset_data"], code_tools=["run_python"])
+    llm = FakeLLM([
+        {"tool_calls": [("describe_column", {"column": "品类"})]},
+        {"tool_calls": [("run_python", {"purpose": "算钓竿销售额", "code": GOOD_CODE})]},
+        {"tool_calls": [("submit_report", {"report": "## 结论\n钓竿销售额 250.0。"})]},
+    ])
+    run = ToolCallingAgent(llm, skills=[], review=False, tool_source="mcp", mcp_specs=[spec]).run(
+        df, "钓竿销售额是多少？")
+    assert run.mode == "mcp" and run.steps[0].ok
+    assert run.steps[0].result.metrics["钓竿销售额"] == 250.0   # 结构化结果经 MCP 原样传回
+    assert run.unverified == []                                   # 数字核对用的是 MCP 返回的真实数字
+    assert [t["name"] for t in run.tool_calls] == ["describe_column", "run_python", "submit_report"]
+    assert any(e["event"] == "mcp_connected" for e in run.log)
+
+
+def test_mcp_config_file_is_valid():
+    specs = load_config()
+    assert specs and specs[0].name == "ecommerce-analyst"
+    assert "analyze" in specs[0].hide_tools and "run_python" in specs[0].allow_tools
+
+
+def test_mcp_structured_result_restores_metrics_and_tables(monkeypatch):
+    """服务器同时返回文字和结构化数据：客户端还原出指标和表格，数字核对、评测都能用。"""
+    import tempfile
+    from analyst.mcp_server import build_server
+    monkeypatch.setenv("ANALYST_DATA_DIR", tempfile.gettempdir())
+    data = pd.DataFrame({"品类": ["钓竿", "鱼线", "钓竿"], "销售额": [100.0, 20.0, 150.0]})
+    box = MCPToolBox(data, [ServerSpec("own", build_server(), data_tool="load_data",
+                                       allow_tools=["run_python"], code_tools=["run_python"])])
+    try:
+        out = box.call("run_python", {"purpose": "汇总", "code":
+                       "g = df.groupby('品类')['销售额'].sum()\n"
+                       "result['metrics'] = {'钓竿销售额': float(g['钓竿'])}\n"
+                       "result['tables'] = {'品类汇总': g.to_frame()}\nresult['notes'] = '按品类汇总'"})
+        r = out.exec_result
+        assert out.ok and r.metrics == {"钓竿销售额": 250.0} and r.notes == "按品类汇总"
+        assert list(r.tables["品类汇总"].columns) == ["品类", "销售额"]
+        assert 250.0 in numbers_from_results([r])
+    finally:
+        box.close()
+
+
+def test_mcp_config_hides_duplicate_verify_tool():
+    assert "verify_report" in load_config()[0].hide_tools

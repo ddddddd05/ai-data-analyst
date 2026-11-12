@@ -54,7 +54,7 @@ class RunResult:
     log: list[dict] = field(default_factory=list)
     seconds: float = 0.0
     skills: list[tuple[str, str]] = field(default_factory=list)  # [(Skill 名称, 加载原因)]
-    mode: str = "plan"                                            # plan：规划-执行；tools：工具调用
+    mode: str = "plan"                                            # plan：规划-执行；tools：工具调用；mcp：工具经 MCP 调用
     tool_calls: list[dict] = field(default_factory=list)          # 工具模式下每次工具调用的记录
     review: ReviewResult | None = None                            # 独立审查 Agent 的意见
     resumed_steps: int = 0                                        # 从存档恢复、没有重新执行的步骤数
