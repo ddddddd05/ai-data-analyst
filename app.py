@@ -24,7 +24,7 @@ EXAMPLES = [
     "评分低的订单有什么共同特点？",
 ]
 
-st.set_page_config(page_title="AI 数据分析助手", page_icon="📊", layout="wide")
+st.set_page_config(page_title="电商经营分析 Agent", page_icon="📊", layout="wide")
 ss = st.session_state
 ss.setdefault("messages", [])   # [{"role": "user"/"assistant", "content": 问题文字 或 RunResult 或 错误文字}]
 
@@ -46,7 +46,8 @@ with st.sidebar:
     st.caption("发送给模型的只有数据概况、前 5 行样例和之前几轮的结论，不会上传整张表。")
 
 # ---------- 数据 ----------
-st.title("📊 AI 数据分析助手")
+st.title("📊 电商经营分析 Agent")
+st.caption("给电商运营用：上传订单表，用中文提问，自动清洗数据、按统一口径算指标、写出带数字出处的分析报告。")
 col_up, col_sample = st.columns([3, 1])
 uploaded = col_up.file_uploader("上传数据文件", type=["csv", "xlsx", "xls"])
 if col_sample.button("使用示例数据", help="模拟的跨境电商渔具订单，含故意制造的数据问题"):

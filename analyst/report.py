@@ -69,7 +69,7 @@ def to_html(run: RunResult) -> str:
         body.append(f"<details><summary>查看代码</summary><pre>{html.escape(s.code)}</pre></details>")
         steps_html.append("\n".join(body))
     return f"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
-<title>AI 数据分析报告</title>
+<title>电商经营分析报告</title>
 <style>
 body{{font-family:"Microsoft YaHei",sans-serif;max-width:900px;margin:24px auto;padding:0 16px;color:#222;line-height:1.7}}
 table{{border-collapse:collapse;margin:8px 0}} td,th{{border:1px solid #ccc;padding:4px 8px}}
@@ -77,7 +77,7 @@ img{{max-width:100%}} pre{{background:#f5f5f5;padding:8px;overflow:auto;font-siz
 .warn{{background:#fff4e5;border:1px solid #f0a500;padding:8px 12px;border-radius:6px}}
 .q{{background:#eef4ff;padding:8px 12px;border-radius:6px}}
 </style></head><body>
-<h2>AI 数据分析报告</h2>
+<h2>电商经营分析报告</h2>
 <p class="q"><b>问题：</b>{html.escape(run.question)}</p>
 <p>数据：{run.profile['rows']} 行 × {run.profile['cols']} 列；用时 {run.seconds} 秒。
 以下内容由 AI 生成，数字经程序核对，结论仍需人工判断。</p>
