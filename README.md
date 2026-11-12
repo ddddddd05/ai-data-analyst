@@ -24,6 +24,29 @@
 
 > 通用表格也能分析，但 Skill、示例数据和评测集都是围绕电商订单设计的，这是项目的定位。
 
+## 前后端结构
+
+```
+浏览器（React 前端，frontend/）
+   │  fetch：/api/sessions、/api/sessions/{id}/ask ……
+   ▼
+后端（FastAPI，api/main.py）── 密钥只在这里（.env）
+   │  调用
+   ▼
+Agent（analyst/）── 规划-执行 / 工具调用 / 经 MCP 调用
+```
+
+| 接口 | 作用 |
+|---|---|
+| `POST /api/sessions` | 新建对话 |
+| `POST /api/sessions/{id}/sample`、`/upload` | 使用示例数据 / 上传 CSV、Excel |
+| `POST /api/sessions/{id}/ask` | 提问：用 **SSE**（服务器推送事件）一边分析一边推送进度，最后推送完整结果 |
+| `POST /api/sessions/{id}/clear` | 清空对话（短期记忆） |
+| `GET / POST / DELETE /api/preferences` | 长期偏好 |
+| `GET /api/runs/{id}/report.html`、`/log.json` | 下载报告、运行日志 |
+
+为什么用 SSE：一次分析要 20～40 秒，如果等全部做完才返回，页面会一直空白；SSE 让后端每完成一步就推一条进度（“正在执行第 2 步……”），前端立刻显示。会话保存在后端内存里，适合单人本地使用。
+
 ## 工作流程
 
 ```
@@ -271,24 +294,50 @@ python evals/run_eval.py --mode mcp --label 经MCP调用    # 工具调用模式
 | `analyst/mcp_server.py` + `mcp_server.py` | MCP 服务器：把工具和护栏开放给 Claude 等客户端 | 工具开放 |
 | `analyst/mcp_client.py` + `mcp_servers.json` | MCP 客户端：Agent 连接 MCP 服务器获取工具，按只读标记和白名单控制权限 | 工具接入 |
 | `analyst/report.py` | 导出 HTML 报告和 JSON 日志 | 可追溯 |
-| `app.py` | Streamlit 对话式网页界面 | — |
-| `tests/test_agent.py` | 65 个离线测试 | 测试 |
+| `api/main.py` + `api/serialize.py` | 后端（FastAPI）：会话、上传、提问（SSE 流式进度）、偏好、下载 | 接口层 |
+| `frontend/` | 前端（React + Vite）：设置栏、数据区、对话、报告与分析过程 | 界面 |
+| `tests/test_agent.py`、`tests/test_api.py` | 72 个离线测试（Agent 65 个 + 后端接口 7 个） | 测试 |
 | `evals/` | 14 道题的评测集 + 自动打分；审查员专项评测；任务恢复故障注入评测 | 评测 |
 | `docs/调优记录.md` | 每次真实运行的问题、原因、改进和效果 | 调优 |
 | `make_sample_data.py` | 生成模拟电商订单数据 | — |
 
 ## 快速开始
 
+需要 Python 3.11+ 和 Node.js 18+。
+
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-
-# 配置密钥：复制 .env.example 为 .env，填入 API Key
-streamlit run app.py
+# 配置密钥：复制 .env.example 为 .env，填入 API Key（密钥只在后端使用，不会发到浏览器）
 ```
 
-打开网页后点“使用示例数据”，点一个示例问题，或在底部输入框提问，之后可以继续追问。
+**方式一：只开一个端口（推荐日常使用）**——先打包前端，再启动后端，后端会同时提供网页：
+
+```bash
+cd frontend
+npm install
+npm run build
+cd ..
+uvicorn api.main:app --port 8000
+```
+
+打开 http://localhost:8000 ，点“使用示例数据”，点一个示例问题，或在底部输入框提问，之后可以继续追问。
+
+**方式二：开发模式（改前端代码时用，保存后页面自动刷新）**——开两个终端：
+
+```bash
+uvicorn api.main:app --port 8000 --reload
+```
+
+```bash
+cd frontend
+npm run dev
+```
+
+打开 http://localhost:5173 ，前端会把 `/api` 开头的请求转发给 8000 端口的后端。
+
+后端接口文档（FastAPI 自动生成，可以直接在网页上测试每个接口）：http://localhost:8000/docs
 
 ### 获取 API Key
 
@@ -324,7 +373,8 @@ python -m pytest -q
 - 记忆：第 4 轮才压缩最早一轮、编号接着摘要往下数；压缩失败有兜底；偏好同主题覆盖、删除、重开文件还在；没有“记住/以后”等词不额外调用模型；偏好进入所有提示词；
 - 任务恢复：断网后从第 2 步继续且不重新规划；换问题或换数据不复用存档；工具模式接着上次对话；存档损坏从头开始；
 - MCP 服务器：工具清单和权限注解；危险代码被拦；报告核对；只能读授权目录；用 stdio 真实启动子进程并调用；
-- MCP 客户端：第三方服务器的危险工具默认不开放、写进白名单才开放；按配置启动自己的服务器并调用；Agent 经 MCP 完成一次分析；结构化结果还原出指标和表格。
+- MCP 客户端：第三方服务器的危险工具默认不开放、写进白名单才开放；按配置启动自己的服务器并调用；Agent 经 MCP 完成一次分析；结构化结果还原出指标和表格；
+- 后端接口（`tests/test_api.py`）：配置接口不泄露密钥；提问时先推送进度再推送结果，报告和日志可下载；没有数据或参数不合法时拒绝；只说偏好时只保存不分析；上传 CSV 和拒绝其他文件类型；失败时提示可从断点继续；多轮后对话摘要生效。
 
 模型的实际效果用真实模型运行评估，记录在调优记录里。
 
