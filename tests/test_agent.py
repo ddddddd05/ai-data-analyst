@@ -241,3 +241,34 @@ def test_short_plan_keeps_last_step(df):
 
 def test_percent_without_sign_is_verified():
     assert verify_report_numbers("退货金额率(%)：钓竿 7.16，配件 1.68", [0.0716, 0.0168]) == []
+
+
+# ---------- 评测集：打分逻辑本身要可靠 ----------
+def test_eval_cases_file_is_valid():
+    import json
+    from evals.run_eval import CHECKS, CASES
+    spec = json.loads(CASES.read_text(encoding="utf-8"))
+    assert len(spec["cases"]) >= 10
+    for c in spec["cases"]:
+        assert c["checks"] and set(c["checks"]) <= set(CHECKS), c["id"]
+
+
+def test_eval_grading_pass_and_fail(df):
+    from evals.run_eval import evaluate
+    plan = '{"steps": [{"id": 1, "goal": "汇总", "method": "分组"}]}'
+    code = ("```python\ng = df.drop_duplicates().groupby('品类')['销售额'].sum()\n"
+            "result['tables'] = {'品类': g.to_frame()}\n```")
+    case_ok = {"id": "T1", "category": "测试", "question": "钓竿销售额？",
+               "checks": {"no_failed_steps": True,
+                          "result_has_number": [{"label": "钓竿", "values": [250.0], "tol": 0.01}],
+                          "report_contains": [["钓竿"]], "report_not_contains": ["综合评分"]}}
+    case_bad = {"id": "T2", "category": "测试", "question": "钓竿销售额？",
+                "checks": {"result_has_number": [{"label": "钓竿", "values": [999.0], "tol": 0.01}],
+                           "report_not_contains": ["综合评分"]}}
+    llm = FakeLLM([plan, code, "## 结论\n钓竿 250。", plan, code, "## 结论\n钓竿综合评分最高。"])
+    agent = DataAnalystAgent(llm, skills=[])
+    ok, bad = evaluate(agent, df, [case_ok, case_bad], log=lambda *_: None)
+    assert ok["passed"] is True
+    assert bad["passed"] is False
+    failed = {c["check"] for c in bad["checks"] if not c["ok"]}
+    assert failed == {"数字正确", "禁止内容"}
