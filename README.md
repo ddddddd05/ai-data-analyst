@@ -153,6 +153,8 @@ Claude Code / Claude 桌面软件 ──MCP──► 本项目的 MCP 服务器�
 | 没标只读（可能改东西、删东西） | 默认不开放，在 `allow_tools` 里写明才开放；强行调用会被拒绝 |
 | `hide_tools` 里的工具 | 不开放：`load_data` 由 Agent 统一调用；`analyze` 会让 Agent 调用自己；`verify_report` 和 Agent 自带的核对重复，开放后模型会反复核对、绕圈（实测过，见调优记录） |
 
+评测：经 MCP 调用 14/14，和同时段直接调用（14/14）正确率相同，平均慢约 4 秒，主要花在每道题启动一次服务器上。
+
 局限：MCP 模式下清洗后的数据保存在服务器进程里，存不进本地存档，所以这个模式不支持断点续跑；只连自己的服务器时比直接调用多一层进程间通信。
 
 ## MCP 服务器：让 Claude 也能用这套工具
@@ -227,6 +229,7 @@ claude mcp add ecommerce-analyst -- C:\code\ai-data-analyst\.venv\Scripts\python
 ```bash
 python evals/run_eval.py --label 这次改了什么
 python evals/run_eval.py --mode tools --label 工具模式   # 评测工具调用模式
+python evals/run_eval.py --mode mcp --label 经MCP调用    # 工具调用模式，工具经 MCP 服务器
 ```
 
 | 轮次 | 通过 | 平均用时 | 改了什么 |
@@ -241,6 +244,7 @@ python evals/run_eval.py --mode tools --label 工具模式   # 评测工具调�
 | 第五轮：加入记忆（工具调用） | 13 / 14 | 24.6 秒 | C13、C14 通过；C01 为否定句误判，改进检查规则 |
 | 第六轮：加入任务恢复（规划-执行） | **14 / 14** | 25.3 秒 | — |
 | 第六轮：加入任务恢复（工具调用） | **14 / 14** | 23.5 秒 | — |
+| 第七轮：工具经 MCP 调用（Agent 作为 MCP 客户端） | **14 / 14** | 29.7 秒 | 同时段直接调用对照 14/14、25.5 秒；多出的时间主要是每题启动一次服务器（约 3 秒） |
 
 另有审查员专项评测（`python evals/run_review_eval.py`）：8 份人工报告，5 份故意埋了结论与数字矛盾的错误，审查员抓出 5/5，正确报告误报 0/3（题目少，只说明能抓住典型矛盾）。
 
