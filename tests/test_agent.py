@@ -272,3 +272,85 @@ def test_eval_grading_pass_and_fail(df):
     assert bad["passed"] is False
     failed = {c["check"] for c in bad["checks"] if not c["ok"]}
     assert failed == {"数字正确", "禁止内容"}
+
+
+# ---------- 工具模式：Function Calling + 工具权限 ----------
+from analyst.tool_agent import ToolCallingAgent  # noqa: E402
+from analyst.tools import READ, ToolBox  # noqa: E402
+
+GOOD_CODE = ("s = df.groupby('品类')['销售额'].sum()\n"
+             "result['metrics'] = {'钓竿销售额': float(s['钓竿'])}\nresult['notes'] = '按品类汇总'")
+
+
+def test_tool_agent_full_loop(df):
+    llm = FakeLLM([
+        {"tool_calls": [("describe_column", {"column": "品类"})]},
+        {"tool_calls": [("run_python", {"purpose": "算钓竿销售额", "code": GOOD_CODE})]},
+        {"tool_calls": [("submit_report", {"report": "## 结论\n钓竿销售额 250.0。"})]},
+    ])
+    run = ToolCallingAgent(llm, skills=[]).run(df, "钓竿销售额是多少？")
+    assert run.mode == "tools"
+    assert [t["name"] for t in run.tool_calls] == ["describe_column", "run_python", "submit_report"]
+    assert len(run.steps) == 1 and run.steps[0].ok
+    assert run.steps[0].result.metrics["钓竿销售额"] == 250.0
+    assert run.report.startswith("## 结论") and run.unverified == []
+
+
+def test_tool_agent_unsafe_code_is_blocked_then_retried(df):
+    llm = FakeLLM([
+        {"tool_calls": [("run_python", {"purpose": "算销售额", "code": "import os\nos.listdir('.')"})]},
+        {"tool_calls": [("run_python", {"purpose": "算销售额", "code": GOOD_CODE})]},
+        {"tool_calls": [("submit_report", {"report": "钓竿销售额 250.0"})]},
+    ])
+    run = ToolCallingAgent(llm, skills=[]).run(df, "钓竿销售额？")
+    first = run.tool_calls[0]
+    assert not first["ok"] and "安全检查未通过" in first["result"]
+    # 失败后紧接着的重试算同一步：1 步，尝试 2 次，最终成功
+    assert len(run.steps) == 1 and run.steps[0].attempts == 2 and run.steps[0].ok
+
+
+def test_tool_call_limit_stops_endless_loop(df):
+    endless = [{"tool_calls": [("preview_data", {"n": 3})]}] * 3
+    llm = FakeLLM(endless + ["## 结论\n达到上限后写的报告"])
+    run = ToolCallingAgent(llm, max_tool_calls=3, skills=[]).run(df, "随便看看")
+    assert len(run.tool_calls) == 3
+    assert "达到上限后写的报告" in run.report
+    assert any(e["event"] == "tool_limit" for e in run.log)
+
+
+def test_toolbox_permissions(df):
+    box = ToolBox(df, skills=[], allowed_levels={READ})
+    # 只读权限下：run_python 不出现在工具清单里，强行调用也会被拒绝
+    assert "run_python" not in [t["function"]["name"] for t in box.schemas()]
+    out = box.call("run_python", {"purpose": "x", "code": "result['notes']='x'"})
+    assert not out.ok and "权限不足" in out.text
+    # 不存在的工具（比如读写文件）根本不提供
+    out = box.call("write_file", {"path": "a.txt"})
+    assert not out.ok and "不提供" in out.text
+    assert box.call("preview_data", {"n": 2}).ok
+
+
+def test_toolbox_cleaned_data_used_by_later_calls(df):
+    box = ToolBox(df, skills=[])
+    out = box.call("run_python", {"purpose": "清洗", "code":
+                   "c = df.drop_duplicates()\nresult['cleaned_df'] = c\nresult['notes'] = '去重'"})
+    assert out.ok and len(box.df) == 5
+    assert "共 5 行" in box.call("preview_data", {"n": 2}).text
+
+
+def test_tool_agent_loads_skill_by_model_choice(df):
+    from analyst.skills import load_skills
+    llm = FakeLLM([
+        {"tool_calls": [("load_skill", {"name": "电商指标"})]},
+        {"tool_calls": [("submit_report", {"report": "无"})]},
+    ])
+    run = ToolCallingAgent(llm, skills=load_skills()).run(df, "退货率？")
+    assert [n for n, _ in run.skills] == ["电商指标"]
+    assert "退货率" in run.tool_calls[0]["result"]
+
+
+def test_eval_forbidden_word_ignores_negation():
+    from evals.run_eval import _affirmative_hit
+    assert _affirmative_hit("给出综合评分：钓竿 90 分", "综合评分")
+    assert not _affirmative_hit("分别列示，未做综合评分", "综合评分")
+    assert _affirmative_hit("未做综合评分。但最后给出综合评分 8 分", "综合评分")

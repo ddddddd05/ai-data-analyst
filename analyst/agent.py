@@ -51,6 +51,8 @@ class RunResult:
     log: list[dict] = field(default_factory=list)
     seconds: float = 0.0
     skills: list[tuple[str, str]] = field(default_factory=list)  # [(Skill 名称, 加载原因)]
+    mode: str = "plan"                                            # plan：规划-执行；tools：工具调用
+    tool_calls: list[dict] = field(default_factory=list)          # 工具模式下每次工具调用的记录
 
 
 class DataAnalystAgent:

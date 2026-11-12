@@ -89,5 +89,6 @@ img{{max-width:100%}} pre{{background:#f5f5f5;padding:8px;overflow:auto;font-siz
 
 
 def to_log_json(run: RunResult) -> str:
-    return json.dumps({"question": run.question, "plan": run.plan, "unverified": run.unverified,
+    return json.dumps({"question": run.question, "mode": run.mode, "plan": run.plan,
+                       "tool_calls": run.tool_calls, "unverified": run.unverified,
                        "seconds": run.seconds, "log": run.log}, ensure_ascii=False, indent=2, default=str)

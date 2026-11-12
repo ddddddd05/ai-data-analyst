@@ -16,6 +16,15 @@ class LLM(Protocol):
     def chat(self, system: str, user: str) -> str: ...
 
 
+class ToolLLM(Protocol):
+    """支持工具调用（Function Calling）的模型。
+
+    chat_tools 返回 {"content": 文字, "tool_calls": [{"id", "name", "arguments"(dict)}],
+    "raw": 原样放回对话历史的 assistant 消息}。
+    """
+    def chat_tools(self, messages: list[dict], tools: list[dict]) -> dict: ...
+
+
 class OpenAICompatLLM:
     def __init__(self, cfg: LLMConfig, temperature: float = 0.2):
         from openai import DefaultHttpxClient, OpenAI  # 只在真正调用时才需要安装
@@ -36,6 +45,22 @@ class OpenAICompatLLM:
         )
         return resp.choices[0].message.content or ""
 
+    def chat_tools(self, messages: list[dict], tools: list[dict]) -> dict:
+        """用 OpenAI 兼容接口的 tools 参数，让模型自己决定调用哪个工具。"""
+        kwargs = {"tools": tools} if tools else {}
+        resp = self.client.chat.completions.create(
+            model=self.model, temperature=self.temperature, messages=messages, **kwargs)
+        msg = resp.choices[0].message
+        calls = []
+        for tc in msg.tool_calls or []:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {"_bad_json": tc.function.arguments}
+            calls.append({"id": tc.id, "name": tc.function.name, "arguments": args})
+        return {"content": msg.content or "", "tool_calls": calls,
+                "raw": msg.model_dump(exclude_none=True)}
+
 
 class FakeLLM:
     """按顺序返回预先写好的回答，用于离线测试 Agent 的流程。"""
@@ -49,6 +74,24 @@ class FakeLLM:
         if not self.replies:
             raise RuntimeError("FakeLLM 的预设回答用完了")
         return self.replies.pop(0)
+
+    def chat_tools(self, messages: list[dict], tools: list[dict]) -> dict:
+        """预设回答可以是字符串（模型直接回复文字）或
+        {"tool_calls": [("工具名", {参数}), ...]}（模型调用工具）。"""
+        self.calls.append(("tools", messages[-1].get("content", "")))
+        if not self.replies:
+            raise RuntimeError("FakeLLM 的预设回答用完了")
+        r = self.replies.pop(0)
+        if isinstance(r, str):
+            return {"content": r, "tool_calls": [], "raw": {"role": "assistant", "content": r}}
+        calls = [{"id": f"call_{len(self.calls)}_{i}", "name": n, "arguments": a}
+                 for i, (n, a) in enumerate(r.get("tool_calls", []))]
+        raw = {"role": "assistant", "content": r.get("content", ""),
+               "tool_calls": [{"id": c["id"], "type": "function",
+                               "function": {"name": c["name"],
+                                            "arguments": json.dumps(c["arguments"], ensure_ascii=False)}}
+                              for c in calls]}
+        return {"content": r.get("content", ""), "tool_calls": calls, "raw": raw}
 
 
 def extract_json(text: str):

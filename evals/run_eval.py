@@ -4,6 +4,7 @@
     python evals/run_eval.py                 # 跑全部题目（需要 .env 里的 API Key）
     python evals/run_eval.py --only C01 C07  # 只跑指定题目
     python evals/run_eval.py --label 加入评测前   # 给这次评测起个名字，写进报告
+    python evals/run_eval.py --mode tools        # 评测工具模式（默认 plan：规划-执行模式）
 
 每道题在 evals/cases.json 里有若干“检查标准”，全部通过才算这道题通过。
 结果保存到 docs/评测报告/，每次一份 Markdown（给人看）和一份 JSON（给程序对比）。
@@ -66,8 +67,22 @@ def chk_report_contains(run, groups):
     return not misses, "报告包含要求的内容" if not misses else "报告缺少：" + "；".join(misses)
 
 
+NEGATIONS = ("未做", "未设计", "不做", "不设计", "没有做", "没有设计", "不使用", "未使用", "不打", "不采用", "避免")
+
+
+def _affirmative_hit(report: str, word: str) -> bool:
+    """报告里出现 word，并且前面不是“未做/不设计……”这类否定说法，才算违规。
+    例：“未做综合评分”是遵守规则，不应判错（见调优记录：升级 2 的评测标准修正）。"""
+    start = report.find(word)
+    while start >= 0:
+        if not report[max(0, start - 4):start].endswith(NEGATIONS):
+            return True
+        start = report.find(word, start + 1)
+    return False
+
+
 def chk_report_not_contains(run, words):
-    hits = [w for w in words if w in run.report]
+    hits = [w for w in words if _affirmative_hit(run.report, w)]
     return not hits, "没有出现禁止内容" if not hits else "报告出现了：" + "、".join(hits)
 
 
@@ -111,7 +126,7 @@ def grade(case: dict, run: RunResult) -> dict:
             "skills": [n for n, _ in run.skills], "unverified": run.unverified}
 
 
-def evaluate(agent: DataAnalystAgent, df, cases: list[dict], log=print) -> list[dict]:
+def evaluate(agent, df, cases: list[dict], log=print) -> list[dict]:
     results = []
     for case in cases:
         log(f"[{case['id']}] {case['question']}")
@@ -165,6 +180,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", nargs="*", help="只跑这些题号")
     ap.add_argument("--label", default="评测", help="这次评测的名字")
+    ap.add_argument("--mode", choices=["plan", "tools"], default="plan",
+                    help="plan：规划-执行模式；tools：工具调用模式")
     args = ap.parse_args()
 
     spec = json.loads(CASES.read_text(encoding="utf-8"))
@@ -173,15 +190,19 @@ def main() -> None:
     cfg = get_llm_config()
     if not cfg.ready:
         sys.exit("没有配置 API Key，请先在 .env 里填写")
-    agent = DataAnalystAgent(OpenAICompatLLM(cfg))
+    if args.mode == "tools":
+        from analyst.tool_agent import ToolCallingAgent
+        agent = ToolCallingAgent(OpenAICompatLLM(cfg))
+    else:
+        agent = DataAnalystAgent(OpenAICompatLLM(cfg))
 
     results = evaluate(agent, df, cases)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M")
     md = OUT_DIR / f"{stamp}_{args.label}.md"
-    md.write_text(to_markdown(results, args.label, cfg.model), encoding="utf-8")
+    md.write_text(to_markdown(results, args.label, f"{cfg.model}（{args.mode} 模式）"), encoding="utf-8")
     (OUT_DIR / f"{stamp}_{args.label}.json").write_text(
-        json.dumps({"label": args.label, "model": cfg.model, "results": results},
+        json.dumps({"label": args.label, "model": cfg.model, "mode": args.mode, "results": results},
                    ensure_ascii=False, indent=2), encoding="utf-8")
     ok = sum(r["passed"] for r in results)
     print(f"\n通过 {ok} / {len(results)}，报告：{md}")

@@ -15,6 +15,7 @@ from analyst.config import LLMConfig, get_llm_config
 from analyst.llm import OpenAICompatLLM
 from analyst.profiler import load_table, profile
 from analyst.report import to_html, to_log_json
+from analyst.tool_agent import ToolCallingAgent
 
 SAMPLE = Path(__file__).resolve().parent / "sample_data" / "模拟电商订单.csv"
 EXAMPLES = [
@@ -39,7 +40,15 @@ with st.sidebar:
     api_key = key_input or cfg.api_key
     st.write("✅ 已配置密钥" if api_key else "⚠️ 还没有配置 API Key")
     st.divider()
-    max_retries = st.slider("每步最多重试次数", 0, 3, 2)
+    mode = st.radio("工作模式", ["规划-执行", "工具调用"], horizontal=True,
+                    help="规划-执行：程序先让模型列计划，再一步步执行，流程固定、稳定。\n\n"
+                         "工具调用：模型每一轮自己决定调用哪个工具（看某列、预览数据、加载 Skill、运行代码、提交报告），更灵活。")
+    if mode == "规划-执行":
+        max_retries = st.slider("每步最多重试次数", 0, 3, 2)
+    else:
+        max_tool_calls = st.slider("工具调用次数上限", 5, 25, 15, help="防止模型反复调用工具、陷入死循环")
+        st.caption("工具权限：只读工具直接执行；运行代码先过安全检查再在独立进程执行；"
+                   "读写文件、联网的工具不提供。")
     if st.button("清空对话", disabled=not ss["messages"]):
         ss["messages"] = []
         st.rerun()
@@ -95,6 +104,15 @@ def show_step(rec: StepRecord) -> None:
         st.code(rec.code, language="python")
 
 
+def show_tool_calls(run: RunResult) -> None:
+    with st.expander(f"查看工具调用记录（{len(run.tool_calls)} 次）"):
+        for t in run.tool_calls:
+            args = t["args"].get("purpose") or t["args"].get("name") or t["args"].get("column") or ""
+            st.write(f"{'✅' if t['ok'] else '❌'} {t['n']}. `{t['name']}`（{t['level']}）{args}")
+            if not t["ok"]:
+                st.caption(t["result"][:300])
+
+
 def show_answer(run: RunResult, idx: int) -> None:
     if run.skills:
         st.caption("🧩 加载的 Skill：" + "；".join(f"{n}（{w}）" for n, w in run.skills))
@@ -104,6 +122,8 @@ def show_answer(run: RunResult, idx: int) -> None:
     else:
         st.success("自动校验通过：报告中的数字都能在计算结果中找到出处。")
     st.markdown(run.report)
+    if run.mode == "tools":
+        show_tool_calls(run)
     with st.expander(f"查看分析过程（{len(run.steps)} 步，用时 {run.seconds} 秒）"):
         for rec in run.steps:
             show_step(rec)
@@ -151,13 +171,16 @@ if question:
 
     with st.chat_message("assistant"):
         llm = OpenAICompatLLM(LLMConfig(api_key, base_url, model, use_proxy=cfg.use_proxy))
-        agent = DataAnalystAgent(llm, max_retries=max_retries)
+        if mode == "工具调用":
+            agent = ToolCallingAgent(llm, max_tool_calls=max_tool_calls)
+        else:
+            agent = DataAnalystAgent(llm, max_retries=max_retries)
         with st.status("Agent 工作中……", expanded=True) as status:
             def on_event(kind, payload):
                 if kind == "profile":
                     st.write("🔍 已读取数据概况")
                 elif kind == "skills":
-                    for name, why in payload or [("（无）", "数据干净，不需要专项规则")]:
+                    for name, why in payload or ([("（无）", "数据干净，不需要专项规则")] if mode == "规划-执行" else []):
                         st.write(f"🧩 加载 Skill：{name}（原因：{why}）")
                 elif kind == "plan_trimmed":
                     st.write(f"✂️ 去掉汇总类步骤“{payload}”，改由最后的报告完成")
@@ -171,6 +194,13 @@ if question:
                     st.write(f"　↻ 第{payload['step']}步第{payload['attempt']}次出错，正在让 AI 修正")
                 elif kind == "cleaned":
                     st.write(f"🧹 第{payload['step']}步清洗完成，后续步骤统一使用 {payload['rows']} 行数据")
+                elif kind == "tool_call":
+                    detail = payload["args"].get("purpose") or payload["args"].get("name") or payload["args"].get("column") or ""
+                    st.write(f"🛠️ 第{payload['n']}次调用工具 `{payload['name']}`（{payload['level']}）{detail}")
+                elif kind == "tool_result" and not payload["ok"]:
+                    st.write(f"　↻ `{payload['name']}` 没成功：{payload['text'][:120]}")
+                elif kind == "tool_limit":
+                    st.write(f"⛔ 工具调用达到上限 {payload} 次，强制写报告")
                 elif kind == "verify":
                     st.write("🔎 正在核对报告中的数字")
             try:
