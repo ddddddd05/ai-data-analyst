@@ -75,7 +75,8 @@ def _affirmative_hit(report: str, word: str) -> bool:
     例：“未做综合评分”是遵守规则，不应判错（见调优记录：升级 2 的评测标准修正）。"""
     start = report.find(word)
     while start >= 0:
-        if not report[max(0, start - 4):start].endswith(NEGATIONS):
+        window = report[max(0, start - 6):start]      # 前 6 个字里有否定词就不算（如“未做加权综合评分”）
+        if not any(n in window for n in NEGATIONS):
             return True
         start = report.find(word, start + 1)
     return False
@@ -123,7 +124,9 @@ def grade(case: dict, run: RunResult) -> dict:
     return {"id": case["id"], "category": case["category"], "question": case["question"],
             "passed": all(d["ok"] for d in details), "checks": details,
             "seconds": run.seconds, "steps": len(run.steps),
-            "skills": [n for n, _ in run.skills], "unverified": run.unverified}
+            "skills": [n for n, _ in run.skills], "unverified": run.unverified,
+            # 失败步骤的最后一次报错，方便分析 badcase
+            "step_errors": {f"第{s.id}步": (s.errors or ["无结果"])[-1][-500:] for s in run.steps if not s.ok}}
 
 
 def build_history(case: dict, llm):
@@ -186,6 +189,8 @@ def to_markdown(results: list[dict], label: str, model: str) -> str:
             lines.append(f"### {r['id']}：{r['question']}")
             for c in r["checks"]:
                 lines.append(f"- {'✅' if c['ok'] else '❌'} {c['check']}：{c['detail']}")
+            for step, err in (r.get("step_errors") or {}).items():
+                lines.append(f"- {step}最后一次报错：`{err.splitlines()[-1] if err.strip() else err}`")
             lines += ["", "<details><summary>报告原文</summary>", "", r.get("report", ""), "", "</details>", ""]
     return "\n".join(lines)
 

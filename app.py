@@ -11,8 +11,10 @@ import pandas as pd
 import streamlit as st
 
 from analyst.agent import DataAnalystAgent, RunResult, StepRecord, summarize_for_history
+from analyst.checkpoint import CheckpointStore
 from analyst.config import LLMConfig, get_llm_config, get_reviewer_config
 from analyst.llm import OpenAICompatLLM
+from analyst.memory import ConversationMemory, PreferenceStore, extract_preferences
 from analyst.profiler import load_table, profile
 from analyst.report import to_html, to_log_json
 from analyst.tool_agent import ToolCallingAgent
@@ -28,6 +30,8 @@ EXAMPLES = [
 st.set_page_config(page_title="电商经营分析 Agent", page_icon="📊", layout="wide")
 ss = st.session_state
 ss.setdefault("messages", [])   # [{"role": "user"/"assistant", "content": 问题文字 或 RunResult 或 错误文字}]
+ss.setdefault("memory", ConversationMemory(keep_recent=3))   # 短期记忆：最近 3 轮原文 + 更早的压缩摘要
+prefs: PreferenceStore = ss.setdefault("prefs", PreferenceStore())   # 长期记忆：本地 memory/preferences.json
 
 # ---------- 侧边栏：模型设置 + 对话管理 ----------
 cfg = get_llm_config()
@@ -53,9 +57,25 @@ with st.sidebar:
                              help="报告写完后，另起一次模型调用，专门检查结论和计算结果是否矛盾；"
                                   "发现严重矛盾时让 AI 改一次报告。")
     if st.button("清空对话", disabled=not ss["messages"]):
-        ss["messages"] = []
+        ss["messages"], ss["memory"] = [], ConversationMemory(keep_recent=3)
         st.rerun()
-    st.caption("发送给模型的只有数据概况、前 5 行样例和之前几轮的结论，不会上传整张表。")
+    mem: ConversationMemory = ss["memory"]
+    if mem.summary:
+        with st.expander(f"🗜️ 对话摘要（已压缩 {mem.compressed_turns} 轮）"):
+            st.caption("最近 3 轮保留原文，更早的对话压缩成下面的摘要交给模型：")
+            st.markdown(mem.summary)
+    st.divider()
+    st.subheader("长期记忆（偏好）")
+    st.caption("说“记住，以后退货率都按金额算”就会记下，之后每次分析都遵守。")
+    for item in list(prefs.items):
+        c1, c2 = st.columns([5, 1])
+        c1.write(f"📌 **{item.topic}**：{item.content}")
+        if c2.button("✕", key=f"del_{item.topic}", help="删除这条偏好"):
+            prefs.remove(item.topic)
+            st.rerun()
+    if not prefs.items:
+        st.caption("（暂无）")
+    st.caption("发送给模型的只有数据概况、前 5 行样例、对话摘要和偏好，不会上传整张表。")
 
 # ---------- 数据 ----------
 st.title("📊 电商经营分析 Agent")
@@ -173,18 +193,18 @@ if not ss["messages"]:
         if col.button(q, disabled=not api_key, width="stretch"):
             clicked = q
 
+# 上一个问题中途失败：进度已存档，可以从断点继续
+if ss.get("retry") and ss["messages"] and ss["messages"][-1].get("error"):
+    if st.button(f"↻ 从断点继续：{ss['retry']}", type="primary"):
+        clicked = ss["retry"]
+        ss["messages"] = ss["messages"][:-2]          # 去掉失败的那一问一答，重新执行
+
 typed = st.chat_input("输入问题，可以连续追问，例如“那钓竿为什么退货率高？”" if api_key
                       else "请先在左侧配置 API Key", disabled=not api_key)
 question = (typed or clicked or "").strip()
 
 # ---------- 处理新问题 ----------
 if question:
-    # 之前几轮的“问题 + 结论摘要”作为对话历史
-    history = []
-    for a, b in zip(ss["messages"][::2], ss["messages"][1::2]):
-        if isinstance(b["content"], RunResult):
-            history.append((a["content"], summarize_for_history(b["content"])))
-
     ss["messages"].append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
@@ -195,10 +215,20 @@ if question:
         reviewer = OpenAICompatLLM(rcfg) if rcfg else None
         if mode == "工具调用":
             agent = ToolCallingAgent(llm, max_tool_calls=max_tool_calls,
-                                     reviewer=reviewer, review=use_review)
+                                     reviewer=reviewer, review=use_review, checkpoints=CheckpointStore())
         else:
             agent = DataAnalystAgent(llm, max_retries=max_retries,
-                                     reviewer=reviewer, review=use_review)
+                                     reviewer=reviewer, review=use_review, checkpoints=CheckpointStore())
+        # 长期记忆：这句话里有没有“以后都要这样”的偏好？（没有“记住/以后”等词时不调用模型）
+        new_prefs, has_question = extract_preferences(llm, question)
+        for pf in new_prefs:
+            prefs.add(pf["topic"], pf["content"])
+        if new_prefs and not has_question:
+            ss["messages"].append({"role": "assistant", "content": "📌 已记住：" + "；".join(
+                f"{pf['topic']}——{pf['content']}" for pf in new_prefs) + "。之后的分析都会按这个来。"})
+            st.rerun()
+        if new_prefs:
+            st.caption("📌 已记住新偏好：" + "；".join(pf["content"] for pf in new_prefs))
         with st.status("Agent 工作中……", expanded=True) as status:
             def on_event(kind, payload):
                 if kind == "profile":
@@ -229,14 +259,24 @@ if question:
                     st.write("🧑‍⚖️ 独立审查员正在检查结论是否与计算结果矛盾")
                 elif kind == "review" and payload.revised:
                     st.write("　↻ 审查发现严重矛盾，已让 AI 修改报告")
+                elif kind == "resume":
+                    st.write(f"💾 找到上次的存档：已完成 {payload['done']} 步，从断点继续")
+                elif kind == "preferences":
+                    st.write("📌 遵守长期偏好：" + "；".join(payload))
                 elif kind == "verify":
                     st.write("🔎 正在核对报告中的数字")
             try:
-                run = agent.run(df, question, on_event=on_event, history=history)
+                run = agent.run(df, question, on_event=on_event, history=mem.render(),
+                                preferences=prefs.contents())
                 status.update(label=f"完成，用时 {run.seconds} 秒", state="complete", expanded=False)
                 ss["messages"].append({"role": "assistant", "content": run})
+                ss["retry"] = None
+                # 短期记忆：记下这一轮的结论；超过 3 轮时把最早的一轮压缩进摘要
+                mem.add_turn(question, summarize_for_history(run), llm=llm)
             except Exception as e:  # noqa: BLE001
                 status.update(label="出错了", state="error")
+                ss["retry"] = question
                 ss["messages"].append({"role": "assistant", "error": True,
-                                       "content": f"调用模型失败：{e}\n\n请检查 API Key、接口地址、模型名称和网络。"})
+                                       "content": f"调用模型失败：{e}\n\n已完成的步骤已经存档。检查网络或 API Key 后，"
+                                                  "点下方“从断点继续”，不用从头再来。"})
     st.rerun()

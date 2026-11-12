@@ -23,6 +23,7 @@ from typing import Callable
 import pandas as pd
 
 from . import prompts
+from .checkpoint import CheckpointStore, task_id
 from .agent import (RunResult, StepRecord, _brief, _format_history, check_and_review, format_results,
                     review_context)
 from .llm import ToolLLM
@@ -36,8 +37,9 @@ from .validator import check_step, numbers_from_results
 class ToolCallingAgent:
     def __init__(self, llm: ToolLLM, max_tool_calls: int = 15, timeout: int = 60,
                  skills: list[Skill] | None = None, allowed_levels: set[str] | None = None,
-                 reviewer=None, review: bool = True):
+                 reviewer=None, review: bool = True, checkpoints: CheckpointStore | None = None):
         self.llm = llm
+        self.checkpoints = checkpoints    # 传入后：每轮工具调用后存盘，失败后从断点继续
         self.reviewer = reviewer or llm   # 审查员可以换成另一个模型
         self.review = review
         self.max_tool_calls = max_tool_calls
@@ -78,6 +80,26 @@ class ToolCallingAgent:
         read_outputs: list[str] = []          # 只读工具（预览、查看列）的返回，交给审查员当依据
         report, nudged, used = "", False, 0
 
+        # 任务恢复：有存档就还原对话记录、已完成步骤和工具箱状态，接着上次的对话继续
+        store = self.checkpoints
+        tid = task_id("tools", question, df, history, preferences) if store else ""
+        saved = store.load(tid) if store else None
+        if saved:
+            messages, steps, open_step = saved["messages"], saved["steps"], saved["open_step"]
+            trace, extra_numbers, read_outputs = saved["trace"], saved["extra_numbers"], saved["read_outputs"]
+            nudged, used = saved["nudged"], saved["used"]
+            box.df, box.cleaned, box.loaded_skills = saved["box_df"], saved["box_cleaned"], saved["loaded_skills"]
+            emit("resume", {"done": len(steps), "tool_calls": used})
+        resumed = len(steps)
+
+        def checkpoint() -> None:
+            if store:
+                store.save(tid, {"messages": messages, "steps": steps, "open_step": open_step,
+                                 "trace": trace, "extra_numbers": extra_numbers,
+                                 "read_outputs": read_outputs, "nudged": nudged, "used": used,
+                                 "box_df": box.df, "box_cleaned": box.cleaned,
+                                 "loaded_skills": box.loaded_skills})
+
         # 循环次数也设上限：防止模型一直只回文字、不调工具
         for _ in range(self.max_tool_calls + 3):
             reply = self.llm.chat_tools(messages, box.schemas())
@@ -88,6 +110,7 @@ class ToolCallingAgent:
                     break
                 nudged = True
                 messages.append({"role": "user", "content": prompts.TOOL_NUDGE})
+                checkpoint()
                 continue
 
             finished = False
@@ -121,6 +144,7 @@ class ToolCallingAgent:
                     report, finished = str(args.get("report", "")), True
             if finished:
                 break
+            checkpoint()                        # 每一轮工具调用处理完存一次档
             if used >= self.max_tool_calls:
                 emit("tool_limit", self.max_tool_calls)
                 messages.append({"role": "user", "content": prompts.TOOL_LIMIT_REACHED.format(
@@ -134,11 +158,13 @@ class ToolCallingAgent:
             report.strip(), known, question,
             review_context(ptext, format_results(steps), read_outputs), self.llm,
             self.reviewer if self.review else None, emit)
+        if store:
+            store.clear(tid)                    # 任务完成，删除存档
         plan = [{"id": s.id, "goal": s.goal, "method": "工具模式：run_python"} for s in steps]
         return RunResult(question, prof, plan, steps, report.strip(), unverified, log,
                          round(time.time() - t0, 1),
                          [(n, "模型调用 load_skill 加载") for n in box.loaded_skills],
-                         mode="tools", tool_calls=trace, review=review)
+                         mode="tools", tool_calls=trace, review=review, resumed_steps=resumed)
 
     @staticmethod
     def _record_step(open_step, steps, args, out, rows, rows_after, emit) -> StepRecord | None:

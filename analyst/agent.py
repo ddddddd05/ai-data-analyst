@@ -16,6 +16,7 @@ from typing import Callable
 import pandas as pd
 
 from . import prompts
+from .checkpoint import CheckpointStore, task_id
 from .llm import LLM, extract_code, extract_json
 from .memory import render_preferences
 from .profiler import profile, profile_numbers, profile_to_text
@@ -56,15 +57,17 @@ class RunResult:
     mode: str = "plan"                                            # plan：规划-执行；tools：工具调用
     tool_calls: list[dict] = field(default_factory=list)          # 工具模式下每次工具调用的记录
     review: ReviewResult | None = None                            # 独立审查 Agent 的意见
+    resumed_steps: int = 0                                        # 从存档恢复、没有重新执行的步骤数
 
 
 class DataAnalystAgent:
     def __init__(self, llm: LLM, max_retries: int = 2, timeout: int = 60, max_steps: int = 5,
                  skills: list[Skill] | None = None, reviewer: LLM | None = None,
-                 review: bool = True):
+                 review: bool = True, checkpoints: CheckpointStore | None = None):
         self.llm = llm
         self.reviewer = reviewer or llm   # 审查员可以换成另一个模型
         self.review = review
+        self.checkpoints = checkpoints    # 传入后：每步存盘，失败后同一任务重跑时从断点继续
         self.max_retries = max_retries
         self.timeout = timeout
         self.max_steps = max_steps
@@ -99,26 +102,37 @@ class DataAnalystAgent:
 
         history_text = _format_history(history)
 
-        # ③ 规划
-        plan = self._plan(question, ptext, skills_text, history_text, emit)
+        # 任务恢复：同一任务有存档就读出来，跳过已完成的规划和步骤
+        store = self.checkpoints
+        tid = task_id("plan", question, df, history, preferences) if store else ""
+        saved = store.load(tid) if store else None
+
+        # ③ 规划（有存档时直接用存档里的计划）
+        if saved:
+            plan, steps = saved["plan"], saved["steps"]
+            emit("resume", {"done": len(steps), "total": len(plan)})
+        else:
+            plan, steps = self._plan(question, ptext, skills_text, history_text, emit), []
+            if store:
+                store.save(tid, {"plan": plan, "steps": steps})
         emit("plan", plan)
+        resumed = len(steps)
 
         # ④ 逐步执行；清洗后的数据交给后续步骤共用
         current_df = df
         data_note = f"df 是原始数据（{len(df)} 行），尚未清洗。"
-        steps: list[StepRecord] = []
-        for item in plan:
+        for rec in steps:                       # 恢复时：按存档里的步骤还原“当前数据”
+            current_df, data_note = self._after_step(rec, current_df, data_note, emit)
+        for item in plan[len(steps):]:
             rec = StepRecord(id=int(item.get("id", len(steps) + 1)),
                              goal=str(item.get("goal", "")), method=str(item.get("method", "")))
             emit("step_start", rec)
             self._run_step(rec, current_df, data_note, question, ptext, skills_text, steps, emit)
             steps.append(rec)
-            if rec.ok and rec.result.cleaned_df is not None:
-                current_df = rec.result.cleaned_df
-                data_note = (f"df 是第{rec.id}步清洗后的数据（{len(current_df)} 行），"
-                             f"清洗说明：{rec.result.notes} 不要重复清洗。")
-                emit("cleaned", {"step": rec.id, "rows": len(current_df)})
+            current_df, data_note = self._after_step(rec, current_df, data_note, emit)
             emit("step_done", rec)
+            if store:
+                store.save(tid, {"plan": plan, "steps": steps})   # 每完成一步存一次档
 
         # ⑤ 报告 → ⑥ 核对数字 → ⑦ 独立审查（有严重矛盾就改一次）
         results_text = format_results(steps)
@@ -128,9 +142,21 @@ class DataAnalystAgent:
         report, unverified, review = check_and_review(
             report, known, question, review_context(ptext, results_text), self.llm,
             self.reviewer if self.review else None, emit)
+        if store:
+            store.clear(tid)                    # 任务完成，删除存档
         return RunResult(question, prof, plan, steps, report, unverified, log,
                          round(time.time() - t0, 1), [(s.name, why) for s, why in chosen],
-                         review=review)
+                         review=review, resumed_steps=resumed)
+
+    @staticmethod
+    def _after_step(rec: StepRecord, current_df, data_note, emit):
+        """清洗步骤成功后，之后的步骤改用清洗后的数据。"""
+        if rec.ok and rec.result.cleaned_df is not None:
+            current_df = rec.result.cleaned_df
+            data_note = (f"df 是第{rec.id}步清洗后的数据（{len(current_df)} 行），"
+                         f"清洗说明：{rec.result.notes} 不要重复清洗。")
+            emit("cleaned", {"step": rec.id, "rows": len(current_df)})
+        return current_df, data_note
 
     # ---------- 规划 ----------
     def _plan(self, question, ptext, skills_text, history_text, emit) -> list[dict]:

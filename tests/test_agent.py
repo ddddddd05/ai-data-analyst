@@ -429,3 +429,217 @@ def test_reviewer_sees_profile_and_read_tool_results(df):
 def test_eval_negation_includes_bu_she():
     from evals.run_eval import _affirmative_hit
     assert not _affirmative_hit("重点投入候选的对比（不设综合评分，分维度列出）", "综合评分")
+
+
+# ---------- 记忆：长对话压缩 + 用户偏好 ----------
+from analyst.memory import ConversationMemory, PreferenceStore, extract_preferences  # noqa: E402
+
+
+def test_memory_keeps_recent_turns_and_compresses_older():
+    llm = FakeLLM(["- 第1轮：钓竿退货率最高 6.68%"])
+    mem = ConversationMemory(keep_recent=3)
+    for i, (q, c) in enumerate([("退货率？", "钓竿最高 6.68%"), ("月度？", "7月最高"),
+                                ("ROAS？", "店铺A 最高"), ("缺失？", "评分缺失 101 条")], 1):
+        compressed = mem.add_turn(q, c, llm=llm)
+        assert compressed == (i == 4)          # 第 4 轮时才把第 1 轮压缩
+    text = mem.render()
+    assert "更早对话的摘要（共 1 轮" in text and "钓竿退货率最高" in text
+    assert "第2轮问题：月度？" in text and "第4轮问题：缺失？" in text   # 轮次编号接着摘要往下数
+    assert "第1轮问题" not in text
+    # 压缩时，旧摘要和被移出的那一轮都交给了模型
+    assert "退货率？" in llm.calls[0][1]
+
+
+def test_memory_compress_falls_back_when_llm_fails():
+    mem = ConversationMemory(keep_recent=1)
+    mem.add_turn("问1", "结论1", llm=FakeLLM([]))
+    mem.add_turn("问2", "结论2", llm=FakeLLM([]))       # 模型出错 → 简单拼接，不中断
+    assert "问1" in mem.summary and "结论1" in mem.summary
+
+
+def test_preferences_store_overwrite_remove_and_persist(tmp_path):
+    f = tmp_path / "prefs.json"
+    store = PreferenceStore(f)
+    store.add("退货率口径", "按订单数")
+    store.add("退货率口径", "按金额")                      # 同一主题：新的覆盖旧的
+    store.add("小数位", "保留两位")
+    assert store.contents() == ["退货率口径：按金额", "小数位：保留两位"]
+    assert PreferenceStore(f).contents() == store.contents()   # 重新打开还在
+    store.remove("小数位")
+    assert PreferenceStore(f).contents() == ["退货率口径：按金额"]
+
+
+def test_extract_preferences_only_calls_llm_with_cue_words():
+    llm = FakeLLM(['{"preferences": [{"topic": "退货率口径", "content": "按金额计算"}], "has_question": false}'])
+    assert extract_preferences(llm, "钓竿的退货率是多少？") == ([], True)
+    assert llm.calls == []                                  # 没有“记住/以后”等词，不调用模型
+    prefs, has_q = extract_preferences(llm, "记住，以后退货率都按金额算")
+    assert prefs == [{"topic": "退货率口径", "content": "按金额计算"}] and has_q is False
+
+
+def test_preferences_reach_all_prompts(df):
+    pref = ["退货率口径：按金额计算"]
+    llm = FakeLLM([PLAN1, CODE1, "## 结论\n完成。"])
+    DataAnalystAgent(llm, skills=[], review=False).run(df, "各品类退货率？", preferences=pref)
+    for _, user in llm.calls:                               # 规划、写代码、写报告都看得到
+        assert "用户偏好" in user and "按金额计算" in user
+    tllm = FakeLLM([{"tool_calls": [("submit_report", {"report": "无"})]}])
+    ToolCallingAgent(tllm, skills=[], review=False).run(df, "退货率？", preferences=pref)
+    assert "用户偏好" in tllm.calls[0][1] and "按金额计算" in tllm.calls[0][1]   # 工具模式：在第一条 user 消息里
+
+
+def test_history_text_from_memory_is_used(df):
+    mem = ConversationMemory()
+    mem.summary, mem.compressed_turns = "- 钓竿退货率最高", 5
+    llm = FakeLLM([PLAN1, CODE1, "## 结论\n完成。"])
+    DataAnalystAgent(llm, skills=[], review=False).run(df, "它的客单价？", history=mem.render())
+    assert "钓竿退货率最高" in llm.calls[0][1]
+
+
+# ---------- 任务恢复：断点续跑 ----------
+from analyst.checkpoint import CheckpointStore, task_id  # noqa: E402
+
+PLAN2 = ('{"steps": [{"id": 1, "goal": "清洗", "method": "去重"}, '
+         '{"id": 2, "goal": "各品类销售额", "method": "分组"}]}')
+CLEAN = "```python\nresult['cleaned_df'] = df.drop_duplicates()\nresult['notes'] = '去重'\n```"
+SUM = ("```python\nresult['metrics'] = {'行数': len(df)}\n"
+       "result['tables'] = {'品类': df.groupby('品类')['销售额'].sum().to_frame()}\n```")
+
+
+def test_plan_mode_resumes_from_checkpoint(df, tmp_path):
+    store = CheckpointStore(tmp_path)
+    # 第一次：规划、第 1 步完成后，模型接口“断了”（预设回答用完会报错）
+    with pytest.raises(RuntimeError):
+        DataAnalystAgent(FakeLLM([PLAN2, CLEAN]), skills=[], review=False,
+                         checkpoints=store).run(df, "各品类销售额？")
+    tid = task_id("plan", "各品类销售额？", df)
+    assert store.exists(tid) and len(store.load(tid)["steps"]) == 1
+    # 第二次：同一任务，从第 2 步继续——不再规划、不重跑第 1 步
+    llm2 = FakeLLM([SUM, "## 结论\n完成。"])
+    run = DataAnalystAgent(llm2, skills=[], review=False, checkpoints=store).run(df, "各品类销售额？")
+    assert len(llm2.calls) == 2 and run.resumed_steps == 1
+    assert [s.ok for s in run.steps] == [True, True]
+    assert run.steps[1].data_rows == 5                # 第 2 步用的是存档里清洗后的数据
+    assert any(e["event"] == "resume" for e in run.log)
+    assert not store.exists(tid)                      # 完成后删除存档
+
+
+def test_different_task_does_not_reuse_checkpoint(df, tmp_path):
+    store = CheckpointStore(tmp_path)
+    with pytest.raises(RuntimeError):
+        DataAnalystAgent(FakeLLM([PLAN2, CLEAN]), skills=[], review=False,
+                         checkpoints=store).run(df, "各品类销售额？")
+    assert task_id("plan", "别的问题", df) != task_id("plan", "各品类销售额？", df)
+    assert task_id("plan", "各品类销售额？", df.head(5)) != task_id("plan", "各品类销售额？", df)
+    llm = FakeLLM([PLAN1, CODE1, "## 结论\n完成。"])
+    run = DataAnalystAgent(llm, skills=[], review=False, checkpoints=store).run(df, "别的问题")
+    assert run.resumed_steps == 0 and len(llm.calls) == 3
+
+
+def test_tool_mode_resumes_conversation(df, tmp_path):
+    store = CheckpointStore(tmp_path)
+    first = FakeLLM([
+        {"tool_calls": [("run_python", {"purpose": "清洗", "code":
+                        "result['cleaned_df'] = df.drop_duplicates()\nresult['notes'] = '去重'"})]},
+        {"tool_calls": [("describe_column", {"column": "品类"})]},
+    ])
+    with pytest.raises(RuntimeError):
+        ToolCallingAgent(first, skills=[], review=False, checkpoints=store).run(df, "品类？")
+    second = FakeLLM([{"tool_calls": [("submit_report", {"report": "## 结论\n完成。"})]}])
+    run = ToolCallingAgent(second, skills=[], review=False, checkpoints=store).run(df, "品类？")
+    assert len(second.calls) == 1 and run.resumed_steps == 1
+    assert [t["name"] for t in run.tool_calls] == ["run_python", "describe_column", "submit_report"]
+    assert "列“品类”" in second.calls[0][1]           # 接着上次的对话：最后一条是上次查看列的结果
+    assert run.steps[0].result.cleaned_df is not None and not store.exists(task_id("tools", "品类？", df))
+
+
+def test_corrupted_checkpoint_starts_fresh(df, tmp_path):
+    store = CheckpointStore(tmp_path)
+    tid = task_id("plan", "各品类销售额？", df)
+    tmp_path.mkdir(exist_ok=True)
+    store.path(tid).write_bytes(b"not a pickle")
+    run = DataAnalystAgent(FakeLLM([PLAN1, CODE1, "## 结论\n完成。"]), skills=[], review=False,
+                           checkpoints=store).run(df, "各品类销售额？")
+    assert run.resumed_steps == 0 and run.steps[0].ok
+
+
+def test_eval_negation_window():
+    from evals.run_eval import _affirmative_hit
+    assert not _affirmative_hit("本报告未做加权综合评分。", "综合评分")
+    assert _affirmative_hit("我们给每个品类打了综合评分", "综合评分")
+
+
+# ---------- MCP 服务器 ----------
+import asyncio  # noqa: E402
+
+
+def _mcp_calls(calls, session=None):
+    """在同一个进程里连上 MCP 服务器，依次调用工具，返回每次的文字结果。"""
+    from mcp import Client
+    from analyst.mcp_server import build_server
+
+    async def go():
+        async with Client(build_server(session)) as c:
+            tools = {t.name: t for t in (await c.list_tools()).tools}
+            outs = [(await c.call_tool(name, args)).content[0].text for name, args in calls]
+            return tools, outs
+    return asyncio.run(go())
+
+
+def test_mcp_lists_tools_with_permission_annotations():
+    tools, _ = _mcp_calls([])
+    assert {"load_data", "data_overview", "describe_column", "load_skill", "run_python",
+            "verify_report", "analyze", "reset_data"} <= set(tools)
+    assert tools["describe_column"].annotations.read_only_hint is True
+    assert tools["run_python"].annotations.read_only_hint is False
+    assert not any(n in tools for n in ("write_file", "delete_file", "shell"))   # 不提供危险工具
+
+
+def test_mcp_run_python_is_guarded_and_cleaning_persists():
+    _, outs = _mcp_calls([
+        ("load_data", {}),
+        ("run_python", {"code": "import os\nos.listdir('.')", "purpose": "危险"}),
+        ("run_python", {"code": "result['cleaned_df'] = df.drop_duplicates()\nresult['notes']='去重'",
+                        "purpose": "清洗"}),
+        ("data_overview", {}),
+        ("reset_data", {}),
+    ])
+    assert "2030 行" in outs[0]
+    assert "安全检查未通过" in outs[1]
+    assert "2000 行" in outs[2] and "（清洗后）" in outs[3]
+    assert "2030 行" in outs[4]
+
+
+def test_mcp_verify_report_uses_session_results():
+    _, outs = _mcp_calls([
+        ("run_python", {"code": "result['metrics'] = {'钓竿销售额': 12345.67}", "purpose": "x"}),
+        ("verify_report", {"report": "钓竿销售额 12345.67，预计增长 30.5%"}),
+    ])
+    assert "30.5%" in outs[1] and "12345.67" not in outs[1]
+
+
+def test_mcp_load_data_only_allowed_dirs(tmp_path, monkeypatch):
+    outside = tmp_path / "secret.csv"
+    pd.DataFrame({"a": [1]}).to_csv(outside, index=False)
+    monkeypatch.delenv("ANALYST_DATA_DIR", raising=False)
+    _, outs = _mcp_calls([("load_data", {"path": str(outside)}),
+                          ("load_data", {"path": "../.env"})])
+    assert "没有权限" in outs[0] and "加载失败" in outs[1]
+    monkeypatch.setenv("ANALYST_DATA_DIR", str(tmp_path))       # 用户主动授权这个目录后可以读
+    _, outs = _mcp_calls([("load_data", {"path": str(outside)})])
+    assert "已加载 secret.csv" in outs[0]
+
+
+def test_mcp_server_starts_over_stdio():
+    """像 Claude 一样：把 mcp_server.py 当子进程启动，通过标准输入输出通信。"""
+    from mcp import Client, StdioServerParameters
+    root = Path(__file__).resolve().parent.parent
+    params = StdioServerParameters(command=sys.executable, args=[str(root / "mcp_server.py")])
+
+    async def go():
+        async with Client(params) as c:
+            names = [t.name for t in (await c.list_tools()).tools]
+            text = (await c.call_tool("list_skills", {})).content[0].text
+            return names, text
+    names, text = asyncio.run(go())
+    assert "run_python" in names and "数据清洗" in text
