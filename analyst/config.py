@@ -47,3 +47,13 @@ def get_llm_config() -> LLMConfig:
         model=os.getenv("LLM_MODEL", DEFAULT_MODEL),
         use_proxy=os.getenv("LLM_USE_PROXY", "true").strip().lower() not in ("false", "0", "no"),
     )
+
+
+def get_reviewer_config(cfg: LLMConfig | None = None) -> LLMConfig | None:
+    """审查员的模型：.env 里设置 REVIEWER_MODEL 时用这个模型（同一接口地址和密钥），
+    没设置时返回 None，表示审查员和写报告的模型相同（仍是独立的一次调用、独立的角色）。"""
+    cfg = cfg or get_llm_config()
+    model = os.getenv("REVIEWER_MODEL", "").strip()
+    if not model:
+        return None
+    return LLMConfig(cfg.api_key, cfg.base_url, model, cfg.use_proxy)

@@ -17,7 +17,9 @@ import pandas as pd
 
 from . import prompts
 from .llm import LLM, extract_code, extract_json
+from .memory import render_preferences
 from .profiler import profile, profile_numbers, profile_to_text
+from .reviewer import ReviewResult, review_report, revise_report
 from .sandbox import ExecResult, run_code, static_check
 from .skills import Skill, load_skills, render_skills, select_skills
 from .validator import check_step, numbers_from_results, verify_report_numbers
@@ -53,12 +55,16 @@ class RunResult:
     skills: list[tuple[str, str]] = field(default_factory=list)  # [(Skill 名称, 加载原因)]
     mode: str = "plan"                                            # plan：规划-执行；tools：工具调用
     tool_calls: list[dict] = field(default_factory=list)          # 工具模式下每次工具调用的记录
+    review: ReviewResult | None = None                            # 独立审查 Agent 的意见
 
 
 class DataAnalystAgent:
     def __init__(self, llm: LLM, max_retries: int = 2, timeout: int = 60, max_steps: int = 5,
-                 skills: list[Skill] | None = None):
+                 skills: list[Skill] | None = None, reviewer: LLM | None = None,
+                 review: bool = True):
         self.llm = llm
+        self.reviewer = reviewer or llm   # 审查员可以换成另一个模型
+        self.review = review
         self.max_retries = max_retries
         self.timeout = timeout
         self.max_steps = max_steps
@@ -67,8 +73,10 @@ class DataAnalystAgent:
     # ---------- 对外入口 ----------
     def run(self, df: pd.DataFrame, question: str,
             on_event: Callable[[str, object], None] | None = None,
-            history: list[tuple[str, str]] | None = None) -> RunResult:
-        """history：之前几轮的 [(问题, 结论摘要)]，用于连续追问。"""
+            history: list[tuple[str, str]] | str | None = None,
+            preferences: list[str] | None = None) -> RunResult:
+        """history：之前几轮的 [(问题, 结论摘要)]，或记忆模块压缩好的文字（ConversationMemory.render()）。
+        preferences：用户的长期偏好，和 Skill 一起放进规划、写代码、写报告的提示词。"""
         t0 = time.time()
         log: list[dict] = []
 
@@ -84,8 +92,10 @@ class DataAnalystAgent:
 
         # ② 选择 Skill：根据数据概况和问题，决定加载哪些专项规则
         chosen = select_skills(self.skills, question, prof)
-        skills_text = render_skills(chosen)
+        skills_text = render_skills(chosen) + render_preferences(preferences)
         emit("skills", [(s.name, why) for s, why in chosen])
+        if preferences:
+            emit("preferences", preferences)
 
         history_text = _format_history(history)
 
@@ -110,14 +120,17 @@ class DataAnalystAgent:
                 emit("cleaned", {"step": rec.id, "rows": len(current_df)})
             emit("step_done", rec)
 
-        # ⑤ 报告 → ⑥ 核对数字
-        report = self._report(question, ptext, steps, skills_text, history_text, emit)
+        # ⑤ 报告 → ⑥ 核对数字 → ⑦ 独立审查（有严重矛盾就改一次）
+        results_text = format_results(steps)
+        report = self._report(question, ptext, results_text, skills_text, history_text, emit)
         known = profile_numbers(prof) + numbers_from_results([s.result for s in steps if s.result])
         known.append(float(len(current_df)))
-        unverified = verify_report_numbers(report, known)
-        emit("verify", unverified)
+        report, unverified, review = check_and_review(
+            report, known, question, review_context(ptext, results_text), self.llm,
+            self.reviewer if self.review else None, emit)
         return RunResult(question, prof, plan, steps, report, unverified, log,
-                         round(time.time() - t0, 1), [(s.name, why) for s, why in chosen])
+                         round(time.time() - t0, 1), [(s.name, why) for s, why in chosen],
+                         review=review)
 
     # ---------- 规划 ----------
     def _plan(self, question, ptext, skills_text, history_text, emit) -> list[dict]:
@@ -182,22 +195,63 @@ class DataAnalystAgent:
             code = extract_code(reply)
 
     # ---------- 报告 ----------
-    def _report(self, question, ptext, steps: list[StepRecord], skills_text, history_text,
+    def _report(self, question, ptext, results_text: str, skills_text, history_text,
                 emit) -> str:
-        parts = []
-        for s in steps:
-            if not s.ok:
-                parts.append(f"### 第{s.id}步：{s.goal}\n结果：失败（{(s.errors or ['无结果'])[-1][:200]}）")
-                continue
-            r = s.result
-            tables = "\n".join(f"表格「{k}」：\n{v.to_string(max_rows=15)}" for k, v in r.tables.items())
-            parts.append(f"### 第{s.id}步：{s.goal}（使用 {s.data_rows} 行数据）\n"
-                         f"说明：{r.notes}\n指标：{r.metrics}\n{tables}")
         reply = self.llm.chat(prompts.REPORTER_SYSTEM, prompts.REPORTER_USER.format(
-            question=question, profile=ptext, results="\n\n".join(parts),
+            question=question, profile=ptext, results=results_text,
             skills=skills_text, history=history_text))
         emit("report", reply)
         return reply.strip()
+
+
+def format_results(steps: list[StepRecord]) -> str:
+    """把各步骤结果整理成文字，交给写报告的模型和审查员（两种模式共用）。"""
+    parts = []
+    for s in steps:
+        if not s.ok:
+            parts.append(f"### 第{s.id}步：{s.goal}\n结果：失败（{(s.errors or ['无结果'])[-1][:200]}）")
+            continue
+        r = s.result
+        tables = "\n".join(f"表格「{k}」：\n{v.to_string(max_rows=15)}" for k, v in r.tables.items())
+        parts.append(f"### 第{s.id}步：{s.goal}（使用 {s.data_rows} 行数据）\n"
+                     f"说明：{r.notes}\n指标：{r.metrics}\n{tables}")
+    return "\n\n".join(parts) or "（没有成功的计算步骤）"
+
+
+def review_context(ptext: str, results_text: str, tool_outputs: list[str] | None = None) -> str:
+    """交给审查员的“事实依据”：数据概况 + 计算结果（+ 工具模式下只读工具的返回）。
+
+    数据概况和只读工具的结果都是程序算的，同样是真实数字。只给审查员看计算步骤时，
+    它会把直接引用概况的正确报告误判成“编造”（见调优记录：升级 3 的 C11）。
+    """
+    parts = [f"### 数据概况（程序统计，真实）\n{ptext}", results_text]
+    if tool_outputs:
+        parts.append("### 只读工具返回的结果（程序统计，真实）\n" + "\n\n".join(tool_outputs))
+    return "\n\n".join(parts)
+
+
+def check_and_review(report: str, known: list[float], question: str, results_text: str,
+                     writer: LLM, reviewer: LLM | None, emit):
+    """⑥ 程序核对数字出处 → ⑦ 独立审查结论；有严重矛盾时让写报告的模型改一次，再重新核对数字。
+
+    审查本身出错（网络、格式）时只记录，不影响已经写好的报告。
+    """
+    unverified = verify_report_numbers(report, known)
+    emit("verify", unverified)
+    if reviewer is None:
+        return report, unverified, None
+    emit("review_start", None)
+    try:
+        review = review_report(reviewer, question, results_text, report)
+        if review.serious:
+            report = revise_report(writer, question, results_text, report, review)
+            review.revised = True
+            unverified = verify_report_numbers(report, known)
+            emit("verify", unverified)
+    except Exception as e:  # noqa: BLE001
+        review = ReviewResult(passed=True, error=f"审查未完成：{e}")
+    emit("review", review)
+    return report, unverified, review
 
 
 def summarize_for_history(run: RunResult, limit: int = 600) -> str:
@@ -208,7 +262,9 @@ def summarize_for_history(run: RunResult, limit: int = 600) -> str:
     return text.strip()[:limit]
 
 
-def _format_history(history: list[tuple[str, str]] | None, max_turns: int = 3) -> str:
+def _format_history(history: list[tuple[str, str]] | str | None, max_turns: int = 3) -> str:
+    if isinstance(history, str):          # 记忆模块已经整理好（含压缩摘要）
+        return history or "（这是第一个问题）"
     if not history:
         return "（这是第一个问题）"
     lines = []
@@ -224,6 +280,8 @@ def _brief(payload: object, limit: int = 2000) -> object:
                 "ok": payload.ok, "code": payload.code, "errors": payload.errors,
                 "data_rows": payload.data_rows,
                 "metrics": payload.result.metrics if payload.result else {}}
+    if isinstance(payload, ReviewResult):
+        return payload.to_dict()
     if isinstance(payload, (list, dict, int, float)) or payload is None:
         return payload
     return str(payload)[:limit]

@@ -11,7 +11,7 @@ import pandas as pd
 import streamlit as st
 
 from analyst.agent import DataAnalystAgent, RunResult, StepRecord, summarize_for_history
-from analyst.config import LLMConfig, get_llm_config
+from analyst.config import LLMConfig, get_llm_config, get_reviewer_config
 from analyst.llm import OpenAICompatLLM
 from analyst.profiler import load_table, profile
 from analyst.report import to_html, to_log_json
@@ -49,6 +49,9 @@ with st.sidebar:
         max_tool_calls = st.slider("工具调用次数上限", 5, 25, 15, help="防止模型反复调用工具、陷入死循环")
         st.caption("工具权限：只读工具直接执行；运行代码先过安全检查再在独立进程执行；"
                    "读写文件、联网的工具不提供。")
+    use_review = st.checkbox("独立审查报告", value=True,
+                             help="报告写完后，另起一次模型调用，专门检查结论和计算结果是否矛盾；"
+                                  "发现严重矛盾时让 AI 改一次报告。")
     if st.button("清空对话", disabled=not ss["messages"]):
         ss["messages"] = []
         st.rerun()
@@ -113,6 +116,22 @@ def show_tool_calls(run: RunResult) -> None:
                 st.caption(t["result"][:300])
 
 
+def show_review(run: RunResult) -> None:
+    r = run.review
+    if r is None:
+        return
+    if r.error:
+        st.caption(f"🧑‍⚖️ 独立审查未完成（不影响报告）：{r.error}")
+    elif r.revised:
+        st.warning("🧑‍⚖️ 独立审查发现结论与计算结果矛盾，报告已按审查意见修改一次：\n\n"
+                   + "\n".join(f"- {i['claim']}（结果显示：{i['evidence']}）" for i in r.serious))
+    elif r.issues:
+        st.info("🧑‍⚖️ 独立审查：没有严重矛盾，有几点表述提醒：\n\n"
+                + "\n".join(f"- {i['claim']}（{i['evidence']}）" for i in r.issues))
+    else:
+        st.success("🧑‍⚖️ 独立审查通过：结论与计算结果没有发现矛盾。")
+
+
 def show_answer(run: RunResult, idx: int) -> None:
     if run.skills:
         st.caption("🧩 加载的 Skill：" + "；".join(f"{n}（{w}）" for n, w in run.skills))
@@ -121,6 +140,7 @@ def show_answer(run: RunResult, idx: int) -> None:
                    + "、".join(run.unverified))
     else:
         st.success("自动校验通过：报告中的数字都能在计算结果中找到出处。")
+    show_review(run)
     st.markdown(run.report)
     if run.mode == "tools":
         show_tool_calls(run)
@@ -171,10 +191,14 @@ if question:
 
     with st.chat_message("assistant"):
         llm = OpenAICompatLLM(LLMConfig(api_key, base_url, model, use_proxy=cfg.use_proxy))
+        rcfg = get_reviewer_config(LLMConfig(api_key, base_url, model, use_proxy=cfg.use_proxy))
+        reviewer = OpenAICompatLLM(rcfg) if rcfg else None
         if mode == "工具调用":
-            agent = ToolCallingAgent(llm, max_tool_calls=max_tool_calls)
+            agent = ToolCallingAgent(llm, max_tool_calls=max_tool_calls,
+                                     reviewer=reviewer, review=use_review)
         else:
-            agent = DataAnalystAgent(llm, max_retries=max_retries)
+            agent = DataAnalystAgent(llm, max_retries=max_retries,
+                                     reviewer=reviewer, review=use_review)
         with st.status("Agent 工作中……", expanded=True) as status:
             def on_event(kind, payload):
                 if kind == "profile":
@@ -201,6 +225,10 @@ if question:
                     st.write(f"　↻ `{payload['name']}` 没成功：{payload['text'][:120]}")
                 elif kind == "tool_limit":
                     st.write(f"⛔ 工具调用达到上限 {payload} 次，强制写报告")
+                elif kind == "review_start":
+                    st.write("🧑‍⚖️ 独立审查员正在检查结论是否与计算结果矛盾")
+                elif kind == "review" and payload.revised:
+                    st.write("　↻ 审查发现严重矛盾，已让 AI 修改报告")
                 elif kind == "verify":
                     st.write("🔎 正在核对报告中的数字")
             try:

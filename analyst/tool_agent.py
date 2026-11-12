@@ -23,18 +23,23 @@ from typing import Callable
 import pandas as pd
 
 from . import prompts
-from .agent import RunResult, StepRecord, _brief, _format_history
+from .agent import (RunResult, StepRecord, _brief, _format_history, check_and_review, format_results,
+                    review_context)
 from .llm import ToolLLM
+from .memory import render_preferences
 from .profiler import profile, profile_numbers, profile_to_text
 from .skills import Skill, load_skills
-from .tools import FINISH, LEVEL_NAMES, ToolBox
-from .validator import check_step, numbers_from_results, verify_report_numbers
+from .tools import FINISH, LEVEL_NAMES, READ, ToolBox
+from .validator import check_step, numbers_from_results
 
 
 class ToolCallingAgent:
     def __init__(self, llm: ToolLLM, max_tool_calls: int = 15, timeout: int = 60,
-                 skills: list[Skill] | None = None, allowed_levels: set[str] | None = None):
+                 skills: list[Skill] | None = None, allowed_levels: set[str] | None = None,
+                 reviewer=None, review: bool = True):
         self.llm = llm
+        self.reviewer = reviewer or llm   # 审查员可以换成另一个模型
+        self.review = review
         self.max_tool_calls = max_tool_calls
         self.timeout = timeout
         self.skills = load_skills() if skills is None else skills
@@ -42,7 +47,8 @@ class ToolCallingAgent:
 
     def run(self, df: pd.DataFrame, question: str,
             on_event: Callable[[str, object], None] | None = None,
-            history: list[tuple[str, str]] | None = None) -> RunResult:
+            history: list[tuple[str, str]] | str | None = None,
+            preferences: list[str] | None = None) -> RunResult:
         t0 = time.time()
         log: list[dict] = []
 
@@ -60,13 +66,16 @@ class ToolCallingAgent:
             {"role": "system", "content": prompts.TOOL_AGENT_SYSTEM},
             {"role": "user", "content": prompts.TOOL_AGENT_USER.format(
                 history=_format_history(history), question=question, profile=ptext,
-                skill_list=skill_list)},
+                skill_list=skill_list) + render_preferences(preferences)},
         ]
+        if preferences:
+            emit("preferences", preferences)
 
         steps: list[StepRecord] = []
         open_step: StepRecord | None = None   # run_python 失败后，下一次 run_python 算作同一步的重试
         trace: list[dict] = []
         extra_numbers: list[float] = []
+        read_outputs: list[str] = []          # 只读工具（预览、查看列）的返回，交给审查员当依据
         report, nudged, used = "", False, 0
 
         # 循环次数也设上限：防止模型一直只回文字、不调工具
@@ -100,6 +109,8 @@ class ToolCallingAgent:
                 emit("tool_result", {"n": used, "name": name, "ok": out.ok, "text": out.text[:300]})
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": out.text})
                 extra_numbers += out.numbers
+                if level == READ and name != "load_skill" and out.ok:
+                    read_outputs.append(out.text[:1500])
 
                 if name == "load_skill" and out.ok:
                     emit("skills", [(args.get("name"), "模型调用 load_skill 加载")])
@@ -119,13 +130,15 @@ class ToolCallingAgent:
 
         known = profile_numbers(prof) + numbers_from_results([s.result for s in steps if s.result])
         known += extra_numbers + [float(len(box.df))]
-        unverified = verify_report_numbers(report, known)
-        emit("verify", unverified)
+        report, unverified, review = check_and_review(
+            report.strip(), known, question,
+            review_context(ptext, format_results(steps), read_outputs), self.llm,
+            self.reviewer if self.review else None, emit)
         plan = [{"id": s.id, "goal": s.goal, "method": "工具模式：run_python"} for s in steps]
         return RunResult(question, prof, plan, steps, report.strip(), unverified, log,
                          round(time.time() - t0, 1),
                          [(n, "模型调用 load_skill 加载") for n in box.loaded_skills],
-                         mode="tools", tool_calls=trace)
+                         mode="tools", tool_calls=trace, review=review)
 
     @staticmethod
     def _record_step(open_step, steps, args, out, rows, rows_after, emit) -> StepRecord | None:

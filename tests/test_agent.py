@@ -122,7 +122,7 @@ def test_agent_end_to_end_with_retry(df):
     report = "## 结论\n- 总销售额 326，钓竿 250 最高。\n- 预计明年增长 30.5%。"
     llm = FakeLLM([plan, bad_code, good_code, report])
 
-    run = DataAnalystAgent(llm).run(df, "哪个品类卖得最好？")
+    run = DataAnalystAgent(llm, review=False).run(df, "哪个品类卖得最好？")
 
     step = run.steps[0]
     assert step.ok and step.attempts == 2 and "销量" in step.errors[0]
@@ -136,7 +136,7 @@ def test_agent_blocks_unsafe_code_then_recovers(df):
     unsafe = "```python\nimport os\nresult['metrics']={'x': 1}\n```"
     safe = "```python\nresult['metrics']={'总销售额': float(df['销售额'].sum())}\n```"
     llm = FakeLLM([plan, unsafe, safe, "## 结论\n总销售额 326。"])
-    run = DataAnalystAgent(llm).run(df, "总销售额是多少？")
+    run = DataAnalystAgent(llm, review=False).run(df, "总销售额是多少？")
     assert run.steps[0].ok and "安全检查未通过" in run.steps[0].errors[0]
     assert run.unverified == []
 
@@ -144,7 +144,7 @@ def test_agent_blocks_unsafe_code_then_recovers(df):
 def test_agent_falls_back_when_plan_is_not_json(df):
     code = "```python\nresult['metrics']={'行数': len(df)}\n```"
     llm = FakeLLM(["我觉得应该先看看数据", code, "## 结论\n共有数据。"])
-    run = DataAnalystAgent(llm).run(df, "数据有多少行？")
+    run = DataAnalystAgent(llm, review=False).run(df, "数据有多少行？")
     assert len(run.plan) == 1 and run.steps[0].ok
 
 
@@ -186,7 +186,7 @@ def test_skill_text_reaches_prompts(df):
     plan = '{"steps": [{"id": 1, "goal": "清洗", "method": "去重"}]}'
     code = "```python\nresult['metrics']={'行数': len(df)}\n```"
     llm = FakeLLM([plan, code, "## 结论\n完成。"])
-    run = DataAnalystAgent(llm).run(df, "数据质量如何？")
+    run = DataAnalystAgent(llm, review=False).run(df, "数据质量如何？")
     assert run.skills and run.skills[0][0] == "数据清洗"
     planner_user, coder_user, reporter_user = (c[1] for c in llm.calls)
     for text in (planner_user, coder_user, reporter_user):
@@ -201,7 +201,7 @@ def test_cleaned_data_is_shared_by_later_steps(df):
                   "result['notes'] = '删除重复 1 行'\n```")
     count_code = "```python\nresult['metrics'] = {'行数': len(df)}\n```"
     llm = FakeLLM([plan, clean_code, count_code, "## 结论\n清洗后 5 行。"])
-    run = DataAnalystAgent(llm).run(df, "清洗后有多少行？")
+    run = DataAnalystAgent(llm, review=False).run(df, "清洗后有多少行？")
     assert run.steps[1].result.metrics["行数"] == 5           # 第 2 步拿到的是清洗后的数据
     assert run.steps[1].data_rows == 5
     assert "第1步清洗后的数据（5 行）" in llm.calls[2][1]     # 告诉了模型数据已清洗
@@ -212,10 +212,10 @@ def test_history_is_passed_to_planner(df):
     from analyst.agent import summarize_for_history
     code = "```python\nresult['metrics']={'行数': len(df)}\n```"
     llm = FakeLLM(["不是JSON", code, "## 结论\n- 钓竿最高。\n## 依据\n略"])
-    first = DataAnalystAgent(llm, skills=[]).run(df, "哪个品类最好？")
+    first = DataAnalystAgent(llm, skills=[], review=False).run(df, "哪个品类最好？")
     assert summarize_for_history(first) == "- 钓竿最高。"
     llm2 = FakeLLM(["不是JSON", code, "## 结论\n原因是……"])
-    DataAnalystAgent(llm2, skills=[]).run(df, "那它为什么好？", history=[("哪个品类最好？", "- 钓竿最高。")])
+    DataAnalystAgent(llm2, skills=[], review=False).run(df, "那它为什么好？", history=[("哪个品类最好？", "- 钓竿最高。")])
     assert "第1轮结论：- 钓竿最高。" in llm2.calls[0][1]
 
 
@@ -226,7 +226,7 @@ def test_summary_step_is_dropped(df):
             ' {"id": 3, "goal": "汇总各品类指标供报告比较", "method": "合并"}]}')
     code = "```python\nresult['metrics']={'行数': len(df)}\n```"
     llm = FakeLLM([plan, code, code, "## 结论\n完成。"])
-    run = DataAnalystAgent(llm, skills=[]).run(df, "各品类表现？")
+    run = DataAnalystAgent(llm, skills=[], review=False).run(df, "各品类表现？")
     assert [s.goal for s in run.steps] == ["清洗", "各品类销售额"]
     assert any(e["event"] == "plan_trimmed" for e in run.log)
 
@@ -266,7 +266,7 @@ def test_eval_grading_pass_and_fail(df):
                 "checks": {"result_has_number": [{"label": "钓竿", "values": [999.0], "tol": 0.01}],
                            "report_not_contains": ["综合评分"]}}
     llm = FakeLLM([plan, code, "## 结论\n钓竿 250。", plan, code, "## 结论\n钓竿综合评分最高。"])
-    agent = DataAnalystAgent(llm, skills=[])
+    agent = DataAnalystAgent(llm, skills=[], review=False)
     ok, bad = evaluate(agent, df, [case_ok, case_bad], log=lambda *_: None)
     assert ok["passed"] is True
     assert bad["passed"] is False
@@ -288,7 +288,7 @@ def test_tool_agent_full_loop(df):
         {"tool_calls": [("run_python", {"purpose": "算钓竿销售额", "code": GOOD_CODE})]},
         {"tool_calls": [("submit_report", {"report": "## 结论\n钓竿销售额 250.0。"})]},
     ])
-    run = ToolCallingAgent(llm, skills=[]).run(df, "钓竿销售额是多少？")
+    run = ToolCallingAgent(llm, skills=[], review=False).run(df, "钓竿销售额是多少？")
     assert run.mode == "tools"
     assert [t["name"] for t in run.tool_calls] == ["describe_column", "run_python", "submit_report"]
     assert len(run.steps) == 1 and run.steps[0].ok
@@ -302,7 +302,7 @@ def test_tool_agent_unsafe_code_is_blocked_then_retried(df):
         {"tool_calls": [("run_python", {"purpose": "算销售额", "code": GOOD_CODE})]},
         {"tool_calls": [("submit_report", {"report": "钓竿销售额 250.0"})]},
     ])
-    run = ToolCallingAgent(llm, skills=[]).run(df, "钓竿销售额？")
+    run = ToolCallingAgent(llm, skills=[], review=False).run(df, "钓竿销售额？")
     first = run.tool_calls[0]
     assert not first["ok"] and "安全检查未通过" in first["result"]
     # 失败后紧接着的重试算同一步：1 步，尝试 2 次，最终成功
@@ -312,7 +312,7 @@ def test_tool_agent_unsafe_code_is_blocked_then_retried(df):
 def test_tool_call_limit_stops_endless_loop(df):
     endless = [{"tool_calls": [("preview_data", {"n": 3})]}] * 3
     llm = FakeLLM(endless + ["## 结论\n达到上限后写的报告"])
-    run = ToolCallingAgent(llm, max_tool_calls=3, skills=[]).run(df, "随便看看")
+    run = ToolCallingAgent(llm, max_tool_calls=3, skills=[], review=False).run(df, "随便看看")
     assert len(run.tool_calls) == 3
     assert "达到上限后写的报告" in run.report
     assert any(e["event"] == "tool_limit" for e in run.log)
@@ -344,7 +344,7 @@ def test_tool_agent_loads_skill_by_model_choice(df):
         {"tool_calls": [("load_skill", {"name": "电商指标"})]},
         {"tool_calls": [("submit_report", {"report": "无"})]},
     ])
-    run = ToolCallingAgent(llm, skills=load_skills()).run(df, "退货率？")
+    run = ToolCallingAgent(llm, skills=load_skills(), review=False).run(df, "退货率？")
     assert [n for n, _ in run.skills] == ["电商指标"]
     assert "退货率" in run.tool_calls[0]["result"]
 
@@ -354,3 +354,78 @@ def test_eval_forbidden_word_ignores_negation():
     assert _affirmative_hit("给出综合评分：钓竿 90 分", "综合评分")
     assert not _affirmative_hit("分别列示，未做综合评分", "综合评分")
     assert _affirmative_hit("未做综合评分。但最后给出综合评分 8 分", "综合评分")
+
+
+# ---------- 独立审查 Agent ----------
+PLAN1 = '{"steps": [{"id": 1, "goal": "各品类销售额", "method": "分组求和"}]}'
+CODE1 = ("```python\ng = df.drop_duplicates().groupby('品类')['销售额'].sum()\n"
+         "result['tables'] = {'品类销售额': g.to_frame()}\nresult['notes'] = '按品类汇总'\n```")
+
+
+def test_reviewer_passes_consistent_report(df):
+    llm = FakeLLM([PLAN1, CODE1, "## 结论\n钓竿销售额最高，为 250。", '{"issues": []}'])
+    run = DataAnalystAgent(llm, skills=[]).run(df, "哪个品类销售额最高？")
+    assert run.review.passed and not run.review.revised and run.review.issues == []
+    # 审查员拿到的是“问题 + 步骤结果 + 报告”，看不到写报告时的提示词
+    reviewer_user = llm.calls[-1][1]
+    assert "待审查的报告" in reviewer_user and "品类销售额" in reviewer_user
+
+
+def test_reviewer_catches_contradiction_and_report_is_revised(df):
+    bad = "## 结论\n鱼饵销售额最高。"
+    review = ('{"issues": [{"severity": "严重", "claim": "鱼饵销售额最高", '
+              '"evidence": "表格中钓竿 250 最高，鱼饵 8 最低"}]}')
+    llm = FakeLLM([PLAN1, CODE1, bad, review, "## 结论\n钓竿销售额最高，为 250。"])
+    run = DataAnalystAgent(llm, skills=[]).run(df, "哪个品类销售额最高？")
+    assert run.review.revised and not run.review.passed
+    assert "钓竿销售额最高" in run.report and "鱼饵销售额最高" not in run.report
+    # 修改报告时，审查意见交给了写报告的模型
+    assert "鱼饵销售额最高" in llm.calls[-1][1] and "审查员" in llm.calls[-1][1]
+
+
+def test_reviewer_minor_issue_does_not_trigger_revision(df):
+    review = '{"issues": [{"severity": "提醒", "claim": "大幅领先", "evidence": "表述略夸张"}]}'
+    llm = FakeLLM([PLAN1, CODE1, "## 结论\n钓竿大幅领先。", review])
+    run = DataAnalystAgent(llm, skills=[]).run(df, "哪个品类销售额最高？")
+    assert run.review.passed and not run.review.revised and len(run.review.issues) == 1
+
+
+def test_reviewer_failure_does_not_break_run(df):
+    llm = FakeLLM([PLAN1, CODE1, "## 结论\n钓竿最高。", "我觉得还行"])   # 审查员没按格式回答
+    run = DataAnalystAgent(llm, skills=[]).run(df, "哪个品类销售额最高？")
+    assert run.report == "## 结论\n钓竿最高。" and "无法解析" in run.review.error
+
+
+def test_reviewer_can_be_a_different_model(df):
+    writer = FakeLLM([PLAN1, CODE1, "## 结论\n钓竿最高。"])
+    reviewer = FakeLLM(['{"issues": []}'])
+    run = DataAnalystAgent(writer, skills=[], reviewer=reviewer).run(df, "哪个品类销售额最高？")
+    assert len(reviewer.calls) == 1 and len(writer.calls) == 3 and run.review.passed
+
+
+def test_tool_mode_is_reviewed_too(df):
+    llm = FakeLLM([
+        {"tool_calls": [("run_python", {"purpose": "算钓竿销售额", "code": GOOD_CODE})]},
+        {"tool_calls": [("submit_report", {"report": "## 结论\n钓竿销售额 250.0。"})]},
+        '{"issues": []}',
+    ])
+    run = ToolCallingAgent(llm, skills=[]).run(df, "钓竿销售额？")
+    assert run.review is not None and run.review.passed
+
+
+def test_reviewer_sees_profile_and_read_tool_results(df):
+    # 模型只用只读工具就回答了行数：审查员必须能看到概况和只读工具结果，才不会误判为“编造”
+    llm = FakeLLM([
+        {"tool_calls": [("describe_column", {"column": "品类"})]},
+        {"tool_calls": [("submit_report", {"report": "## 结论\n共 6 行、3 列。"})]},
+        '{"issues": []}',
+    ])
+    ToolCallingAgent(llm, skills=[]).run(df, "数据有多少行多少列？")
+    reviewer_user = llm.calls[-1][1]
+    assert "数据概况（程序统计，真实）" in reviewer_user
+    assert "只读工具返回的结果" in reviewer_user and "列“品类”" in reviewer_user
+
+
+def test_eval_negation_includes_bu_she():
+    from evals.run_eval import _affirmative_hit
+    assert not _affirmative_hit("重点投入候选的对比（不设综合评分，分维度列出）", "综合评分")

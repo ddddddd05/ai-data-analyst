@@ -67,7 +67,7 @@ def chk_report_contains(run, groups):
     return not misses, "报告包含要求的内容" if not misses else "报告缺少：" + "；".join(misses)
 
 
-NEGATIONS = ("未做", "未设计", "不做", "不设计", "没有做", "没有设计", "不使用", "未使用", "不打", "不采用", "避免")
+NEGATIONS = ("未做", "未设计", "不做", "不设计", "不设", "未设", "没有做", "没有设计", "不使用", "未使用", "不打", "不采用", "避免")
 
 
 def _affirmative_hit(report: str, word: str) -> bool:
@@ -126,15 +126,30 @@ def grade(case: dict, run: RunResult) -> dict:
             "skills": [n for n, _ in run.skills], "unverified": run.unverified}
 
 
+def build_history(case: dict, llm):
+    """普通追问题直接用历史列表；带 compress_history 的题，先经过记忆模块压缩（检验压缩后还记不记得早期结论）。"""
+    hist = [tuple(h) for h in case.get("history", [])]
+    if not case.get("compress_history"):
+        return hist
+    from analyst.memory import ConversationMemory
+    mem = ConversationMemory(keep_recent=3)
+    for q, c in hist:
+        mem.add_turn(q, c, llm=llm)
+    return mem.render()
+
+
 def evaluate(agent, df, cases: list[dict], log=print) -> list[dict]:
     results = []
     for case in cases:
         log(f"[{case['id']}] {case['question']}")
         t0 = time.time()
         try:
-            run = agent.run(df, case["question"], history=[tuple(h) for h in case.get("history", [])])
+            run = agent.run(df, case["question"], history=build_history(case, agent.llm),
+                            preferences=case.get("preferences"))
             r = grade(case, run)
             r["report"] = run.report
+            if run.review is not None:
+                r["review"] = run.review.to_dict()
         except Exception as e:  # noqa: BLE001  运行出错也记一笔，不中断整个评测
             r = {"id": case["id"], "category": case["category"], "question": case["question"],
                  "passed": False, "checks": [{"check": "运行", "ok": False, "detail": f"出错：{e}"}],
@@ -151,7 +166,9 @@ def to_markdown(results: list[dict], label: str, model: str) -> str:
              f"- 时间：{datetime.now():%Y-%m-%d %H:%M}",
              f"- 模型：{model}",
              f"- **通过：{ok} / {n}**",
-             f"- 平均用时：{sum(r['seconds'] for r in results) / max(n, 1):.1f} 秒", "",
+             f"- 平均用时：{sum(r['seconds'] for r in results) / max(n, 1):.1f} 秒",
+             f"- 独立审查：发现严重矛盾并修改报告 {sum(1 for r in results if r.get('review', {}).get('revised'))} 题，"
+             f"只有提醒 {sum(1 for r in results if r.get('review', {}).get('issues') and not r['review'].get('revised'))} 题", "",
              "## 各题结果", "", "| 编号 | 类型 | 问题 | 结果 | 用时 | 没通过的检查 |", "|---|---|---|---|---|---|"]
     for r in results:
         bad = "；".join(f"{c['check']}：{c['detail']}" for c in r["checks"] if not c["ok"]) or "—"
@@ -190,11 +207,14 @@ def main() -> None:
     cfg = get_llm_config()
     if not cfg.ready:
         sys.exit("没有配置 API Key，请先在 .env 里填写")
+    from analyst.config import get_reviewer_config
+    rcfg = get_reviewer_config(cfg)
+    reviewer = OpenAICompatLLM(rcfg) if rcfg else None
     if args.mode == "tools":
         from analyst.tool_agent import ToolCallingAgent
-        agent = ToolCallingAgent(OpenAICompatLLM(cfg))
+        agent = ToolCallingAgent(OpenAICompatLLM(cfg), reviewer=reviewer)
     else:
-        agent = DataAnalystAgent(OpenAICompatLLM(cfg))
+        agent = DataAnalystAgent(OpenAICompatLLM(cfg), reviewer=reviewer)
 
     results = evaluate(agent, df, cases)
     OUT_DIR.mkdir(parents=True, exist_ok=True)

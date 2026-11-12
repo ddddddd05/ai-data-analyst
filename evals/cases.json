@@ -320,6 +320,81 @@
         "max_unverified": 3,
         "max_seconds": 90
       }
+    },
+    {
+      "id": "C13",
+      "category": "记忆：用户偏好",
+      "preferences": [
+        "退货率口径：退货率按金额计算，即退货订单的销售额 ÷ 总销售额（不按订单数）"
+      ],
+      "question": "钓竿的退货率是多少？",
+      "checks": {
+        "no_failed_steps": true,
+        "result_has_number": [
+          {
+            "label": "钓竿按金额的退货率（清洗后）",
+            "values": [
+              0.0716,
+              7.16
+            ],
+            "tol": 0.0006
+          }
+        ],
+        "report_contains": [
+          [
+            "金额"
+          ]
+        ],
+        "max_unverified": 3,
+        "max_seconds": 90
+      }
+    },
+    {
+      "id": "C14",
+      "category": "记忆：长对话压缩",
+      "compress_history": true,
+      "history": [
+        [
+          "各品类的退货率是多少？",
+          "钓竿退货率最高，为 6.68%；配件最低，为 1.92%。"
+        ],
+        [
+          "每个月的销售额趋势如何？",
+          "7 月销售额最高，下半年整体高于上半年。"
+        ],
+        [
+          "哪个店铺的广告投入产出比最高？",
+          "店铺A 的 ROAS 最高，为 5.16。"
+        ],
+        [
+          "评分缺失有多少条？",
+          "评分缺失 101 条，约占 4.98%，分析评分时剔除。"
+        ],
+        [
+          "鱼饵一共有多少订单？",
+          "清洗后鱼饵共 489 单。"
+        ]
+      ],
+      "question": "回到最开始问的，退货率最高的那个品类，它的客单价是多少？",
+      "checks": {
+        "no_failed_steps": true,
+        "result_has_number": [
+          {
+            "label": "钓竿客单价（清洗后）",
+            "values": [
+              96.39
+            ],
+            "tol": 0.05
+          }
+        ],
+        "report_contains": [
+          [
+            "钓竿"
+          ]
+        ],
+        "max_unverified": 3,
+        "max_seconds": 90
+      }
     }
   ]
 }
