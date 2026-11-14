@@ -3,7 +3,7 @@
 权限等级（越往下越危险，管得越严）：
 | 等级 | 含义 | 工具 |
 |---|---|---|
-| 只读 read | 只看数据，不改任何东西，直接执行 | preview_data、describe_column、load_skill |
+| 只读 read | 只看数据，不改任何东西，直接执行 | preview_data、describe_column、load_skill、search_knowledge（配置了知识库时） |
 | 执行代码 exec | 运行模型写的 Python，必须先过 sandbox 的静态安全检查，再放进子进程运行 | run_python |
 | 结束 finish | 提交最终报告，结束本轮 | submit_report |
 | 不提供 | 读写文件、联网、执行系统命令——工具箱里根本没有这些工具，模型想调也调不到 | — |
@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import pandas as pd
 
+from .knowledge import KnowledgeBase, knowledge_numbers
 from .sandbox import ExecResult, run_code, static_check
 from .skills import Skill
 
@@ -65,6 +66,15 @@ TOOLS = [
 ]
 
 
+SEARCH_KNOWLEDGE = Tool(
+    "search_knowledge", READ,
+    "检索业务知识库（只读）：字段的业务含义、公司的指标口径和统计规则、平台规则和行业参考值、往期经营结论。"
+    "返回最相关的几段资料和来源。往期、行业数字只能作为对比参照，本期数字仍要用 run_python 计算。",
+    {"type": "object", "properties": {
+        "query": {"type": "string", "description": "要查的内容，用一句话描述，如“广告花费包含哪些费用”"}},
+     "required": ["query"]})
+
+
 @dataclass
 class ToolOutcome:
     ok: bool
@@ -75,12 +85,16 @@ class ToolOutcome:
 
 class ToolBox:
     def __init__(self, df: pd.DataFrame, skills: list[Skill], timeout: int = 60,
-                 allowed_levels: set[str] | None = None):
+                 allowed_levels: set[str] | None = None, knowledge: KnowledgeBase | None = None):
         self.df = df
         self.skills = {s.name: s for s in skills}
         self.timeout = timeout
         self.allowed = allowed_levels or {READ, EXEC, FINISH}
         self.tools = {t.name: t for t in TOOLS}
+        self.knowledge = knowledge
+        if knowledge is not None:                  # 有知识库才把检索工具放进菜单
+            self.tools[SEARCH_KNOWLEDGE.name] = SEARCH_KNOWLEDGE
+        self.kb_hits: list[dict] = []              # 本次检索到过的片段，供界面和日志展示
         self.loaded_skills: list[str] = []
         self.cleaned = False
 
@@ -146,6 +160,18 @@ class ToolBox:
         if name not in self.loaded_skills:
             self.loaded_skills.append(name)
         return ToolOutcome(True, f"### Skill：{skill.name}\n{skill.body}")
+
+    def _search_knowledge(self, query: str) -> ToolOutcome:
+        if self.knowledge is None:
+            return ToolOutcome(False, "没有配置业务知识库。")
+        hits = self.knowledge.search(str(query), k=4)
+        if not hits:
+            return ToolOutcome(True, f"知识库里没有找到和“{query}”相关的资料，不要自行编造规则。")
+        seen = {d["title"] for d in self.kb_hits}
+        self.kb_hits += [h.to_dict() for h in hits if h.chunk.title not in seen]
+        text = "\n\n".join(f"[{n}] 来源：{h.chunk.title}\n{h.chunk.text}" for n, h in enumerate(hits, 1))
+        return ToolOutcome(True, "业务知识库检索结果（模拟的公司资料）：\n\n" + text,
+                           numbers=knowledge_numbers(hits))
 
     # ---------- 执行代码：必须先过安全检查 ----------
     def _run_python(self, code: str, purpose: str = "") -> ToolOutcome:

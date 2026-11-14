@@ -1,4 +1,4 @@
-// 一条回答：加载的 Skill、数字核对、独立审查、报告正文、工具调用记录、分析过程、下载
+// 一条回答：加载的 Skill、引用的业务知识、数字核对、独立审查、报告正文、工具调用记录、分析过程、下载
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import DataTable from "./DataTable.jsx";
@@ -59,6 +59,12 @@ export default function Answer({ result }) {
       {result.skills.length > 0 && (
         <p className="muted small">🧩 加载的 Skill：{result.skills.map((s) => `${s.name}（${s.reason}）`).join("；")}</p>
       )}
+      {result.knowledge?.length > 0 && (
+        <details className="muted small">
+          <summary>📚 引用的业务知识（{result.knowledge.length} 段，混合检索）</summary>
+          <ul>{result.knowledge.map((k) => <li key={k.title}>{k.title}</li>)}</ul>
+        </details>
+      )}
       {result.resumed_steps > 0 && <p className="muted small">💾 从存档恢复了 {result.resumed_steps} 步，没有重做</p>}
       {result.unverified.length > 0 ? (
         <div className="banner warn">⚠ 自动校验：报告中这些数字没有在计算结果里找到出处，请人工核对：{result.unverified.join("、")}</div>
@@ -79,7 +85,7 @@ export default function Answer({ result }) {
               const a = t.args || {};
               return (
                 <li key={t.n}>
-                  {t.ok ? "✅" : "❌"} <code>{t.name}</code>（{t.level}）{a.purpose || a.name || a.column || ""}
+                  {t.ok ? "✅" : "❌"} <code>{t.name}</code>（{t.level}）{a.purpose || a.name || a.column || a.query || ""}
                   {!t.ok && <div className="muted small">{t.result}</div>}
                 </li>
               );

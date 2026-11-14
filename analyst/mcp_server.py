@@ -14,6 +14,7 @@ MCP（Model Context Protocol，模型上下文协议）是一个“通用插座�
 | load_data | 加载 CSV / Excel（只允许示例数据目录或 ANALYST_DATA_DIR 指定的目录） | 只读 |
 | data_overview / preview_data / describe_column | 查看数据 | 只读 |
 | list_skills / load_skill | 查看、加载 Skill（数据清洗规范、电商指标口径） | 只读 |
+| search_knowledge | 检索业务知识库：字段含义、公司口径、平台规则、往期结论（混合检索） | 只读 |
 | run_python | 运行分析代码：先过静态安全检查，再在独立子进程运行，有超时 | 非只读，但不改动任何文件 |
 | verify_report | 核对一份报告里的数字，在本次会话的计算结果里有没有出处 | 只读 |
 | analyze | 让本项目的 DeepSeek Agent 完整分析一个问题（需要 .env 里的 API Key） | 只读，会访问外部模型接口 |
@@ -35,6 +36,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 from .config import ROOT
+from .knowledge import default_knowledge
 from .profiler import load_table, profile, profile_numbers, profile_to_text
 from .skills import load_skills
 from .tools import ToolBox
@@ -48,7 +50,7 @@ RUN_CODE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempot
 INSTRUCTIONS = """电商经营分析工具箱（订单数据）。建议流程：
 1. load_data 加载数据（不传路径则加载示例数据：模拟跨境电商渔具订单），再看 data_overview；
 2. 概况里有重复、缺失、负数、极端值时，先 load_skill("数据清洗")，按规则用 run_python 清洗，把清洗后的数据放进 result["cleaned_df"]，之后的 df 自动变成清洗后的数据；
-3. 涉及销售额、退货率、ROAS 等指标时先 load_skill("电商指标")，按其中口径计算；
+3. 涉及销售额、退货率、ROAS 等指标时先 load_skill("电商指标")，按其中口径计算；需要字段含义、公司口径、平台规则、往期结论时用 search_knowledge；
 4. 所有数字用 run_python 真实算出，写完报告后用 verify_report 核对数字出处；
 5. 也可以直接用 analyze 让本项目自带的 Agent 完整分析一个问题。"""
 
@@ -72,7 +74,7 @@ class Session:
         file = _resolve_data_path(path)
         self.raw = load_table(file)
         self.name = file.name
-        self.box = ToolBox(self.raw, load_skills())
+        self.box = ToolBox(self.raw, load_skills(), knowledge=default_knowledge())
         self.results, self.extra_numbers = [], []
         return file.name
 
@@ -151,6 +153,13 @@ def build_server(session: Session | None = None) -> MCPServer:
         """加载一个 Skill 的规则全文（如“数据清洗”“电商指标”），之后计算和写报告都要遵守。"""
         return _ok_or_raise(s.require().call("load_skill", {"name": name}))
 
+    @mcp.tool(annotations=READ_ONLY)
+    def search_knowledge(query: str) -> str:
+        """检索业务知识库：字段的业务含义、公司的指标口径、平台规则和行业参考值、往期经营结论。往期和行业数字只能作为对比参照。"""
+        out = s.require().call("search_knowledge", {"query": query})
+        s.extra_numbers += out.numbers
+        return _ok_or_raise(out)
+
     @mcp.tool(annotations=RUN_CODE)
     def run_python(code: str, purpose: str = "") -> CallToolResult:
         """运行一段 pandas 分析代码。已有 df、pd、np、plt；结果写进字典 result：
@@ -209,7 +218,7 @@ def build_server(session: Session | None = None) -> MCPServer:
         """撤销清洗，回到刚加载时的原始数据，并清空本次会话的计算结果。"""
         if s.raw is None:
             return "还没有加载数据。"
-        s.box = ToolBox(s.raw, load_skills())
+        s.box = ToolBox(s.raw, load_skills(), knowledge=default_knowledge())
         s.results, s.extra_numbers = [], []
         return f"已恢复原始数据（{len(s.raw)} 行）。"
 

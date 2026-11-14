@@ -395,6 +395,96 @@
         "max_unverified": 3,
         "max_seconds": 90
       }
+    },
+    {
+      "id": "C15",
+      "category": "业务知识：字段含义",
+      "question": "广告花费这一列具体包含哪些费用？用它算出来的 ROAS 要注意什么？",
+      "checks": {
+        "knowledge_include": [
+          [
+            "数据字典 · 广告花费"
+          ]
+        ],
+        "report_contains": [
+          [
+            "站内"
+          ],
+          [
+            "站外",
+            "网红",
+            "优惠券"
+          ]
+        ],
+        "max_unverified": 3,
+        "max_seconds": 90
+      }
+    },
+    {
+      "id": "C16",
+      "category": "业务知识：平台规则",
+      "question": "各品类的退货率有没有触碰平台的退货率红线？",
+      "checks": {
+        "knowledge_include": [
+          [
+            "平台与行业规则 · 平台退货率红线"
+          ]
+        ],
+        "no_failed_steps": true,
+        "result_has_number": [
+          {
+            "label": "钓竿退货率（清洗后）",
+            "values": [
+              0.0668,
+              6.68
+            ],
+            "tol": 0.005
+          }
+        ],
+        "report_contains": [
+          [
+            "钓竿"
+          ]
+        ],
+        "max_unverified": 3,
+        "max_seconds": 90,
+        "report_has_value": [
+          "10%",
+          "8%"
+        ]
+      }
+    },
+    {
+      "id": "C17",
+      "category": "业务知识：往期对比",
+      "question": "和 2024 年相比，钓竿的退货率有没有改善？达到今年定的目标了吗？",
+      "checks": {
+        "knowledge_include": [
+          [
+            "历史经营报告 · 2024 年度经营总结：各品类"
+          ],
+          [
+            "历史经营报告 · 2025 年经营目标"
+          ]
+        ],
+        "no_failed_steps": true,
+        "result_has_number": [
+          {
+            "label": "钓竿退货率（清洗后）",
+            "values": [
+              0.0668,
+              6.68
+            ],
+            "tol": 0.005
+          }
+        ],
+        "max_unverified": 3,
+        "max_seconds": 90,
+        "report_has_value": [
+          "8.1%",
+          "6%"
+        ]
+      }
     }
   ]
 }

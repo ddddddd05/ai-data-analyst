@@ -60,6 +60,10 @@ export default function Sidebar({ config, settings, setSettings, busy, onClear, 
         <input type="checkbox" checked={settings.review} disabled={busy}
           onChange={(e) => set("review", e.target.checked)} /> 独立审查报告
       </label>
+      <label className="check">
+        <input type="checkbox" checked={settings.knowledge} disabled={busy}
+          onChange={(e) => set("knowledge", e.target.checked)} /> 检索业务知识库（RAG）
+      </label>
       <button onClick={onClear} disabled={!canClear || busy}>清空对话</button>
 
       {info?.memory_summary && (

@@ -22,7 +22,7 @@ export default function App() {
   const [input, setInput] = useState("");
   const [prefs, setPrefs] = useState([]);
   const [settings, setSettings] = useState({
-    mode: "plan", maxRetries: 2, maxToolCalls: 15, toolSource: "builtin", review: true,
+    mode: "plan", maxRetries: 2, maxToolCalls: 15, toolSource: "builtin", review: true, knowledge: true,
   });
   const [notice, setNotice] = useState("");
   const bottomRef = useRef(null);
@@ -61,7 +61,7 @@ export default function App() {
       await ask(
         sid,
         { question: q, mode, max_retries: settings.maxRetries, max_tool_calls: settings.maxToolCalls,
-          review: settings.review },
+          review: settings.review, knowledge: settings.knowledge },
         (kind, data) => {
           if (kind === "progress") setProgress((p) => [...p, data.text]);
           if (kind === "preferences_saved") {

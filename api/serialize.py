@@ -57,6 +57,7 @@ def run(run_id: str, r: RunResult) -> dict:
         "skills": [{"name": n, "reason": w} for n, w in r.skills],
         "review": r.review.to_dict() if r.review else None,
         "tool_calls": plain(r.tool_calls), "resumed_steps": r.resumed_steps,
+        "knowledge": plain(r.knowledge),
         "steps": [step(s) for s in r.steps],
     }
 
@@ -67,6 +68,10 @@ def event_text(kind: str, payload) -> str | None:
         return "🔍 已读取数据概况"
     if kind == "skills":
         return "；".join(f"🧩 加载 Skill：{n}（{w}）" for n, w in payload) if payload else None
+    if kind == "knowledge":
+        if not payload:
+            return "📚 业务知识库：没有找到和问题相关的资料"
+        return "📚 检索业务知识：" + "；".join(h["title"] for h in payload)
     if kind == "preferences":
         return "📌 遵守长期偏好：" + "；".join(payload)
     if kind == "resume":
@@ -88,7 +93,7 @@ def event_text(kind: str, payload) -> str | None:
         return f"🧹 第{payload['step']}步清洗完成，后续统一使用 {payload['rows']} 行数据"
     if kind == "tool_call":
         a = payload["args"]
-        detail = a.get("purpose") or a.get("name") or a.get("column") or ""
+        detail = a.get("purpose") or a.get("name") or a.get("column") or a.get("query") or ""
         return f"🛠️ 第{payload['n']}次调用工具 {payload['name']}（{payload['level']}）{detail}"
     if kind == "tool_result" and not payload["ok"]:
         return f"↻ {payload['name']} 没成功：{payload['text'][:120]}"

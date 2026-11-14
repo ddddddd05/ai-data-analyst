@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field
 from analyst.agent import DataAnalystAgent, RunResult, summarize_for_history
 from analyst.checkpoint import CheckpointStore
 from analyst.config import ROOT, get_llm_config, get_reviewer_config
+from analyst.knowledge import default_knowledge
 from analyst.memory import ConversationMemory, PreferenceStore, extract_preferences
 from analyst.profiler import load_table, profile
 from analyst.report import to_html, to_log_json
@@ -61,6 +62,7 @@ class AskRequest(BaseModel):
     max_retries: int = Field(2, ge=0, le=3)
     max_tool_calls: int = Field(15, ge=5, le=25)
     review: bool = True
+    knowledge: bool = True                                    # 检索业务知识库（RAG）
 
 
 class PreferenceRequest(BaseModel):
@@ -184,13 +186,15 @@ def create_app(llm_factory=None, reviewer_factory=None, prefs: PreferenceStore |
                 if new_prefs and not has_question:
                     return
                 reviewer = make_reviewer()
+                kb = default_knowledge() if req.knowledge else None
                 if req.mode in ("tools", "mcp"):
                     agent = ToolCallingAgent(llm, max_tool_calls=req.max_tool_calls, reviewer=reviewer,
                                              review=req.review, checkpoints=ckpt,
-                                             tool_source="mcp" if req.mode == "mcp" else "builtin")
+                                             tool_source="mcp" if req.mode == "mcp" else "builtin",
+                                             knowledge=kb)
                 else:
                     agent = DataAnalystAgent(llm, max_retries=req.max_retries, reviewer=reviewer,
-                                             review=req.review, checkpoints=ckpt)
+                                             review=req.review, checkpoints=ckpt, knowledge=kb)
 
                 def on_event(kind, payload):
                     text = serialize.event_text(kind, payload)

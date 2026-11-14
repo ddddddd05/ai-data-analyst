@@ -17,6 +17,7 @@ import pandas as pd
 
 from . import prompts
 from .checkpoint import CheckpointStore, task_id
+from .knowledge import KnowledgeBase, knowledge_numbers, render_knowledge
 from .llm import LLM, extract_code, extract_json
 from .memory import render_preferences
 from .profiler import profile, profile_numbers, profile_to_text
@@ -58,13 +59,16 @@ class RunResult:
     tool_calls: list[dict] = field(default_factory=list)          # 工具模式下每次工具调用的记录
     review: ReviewResult | None = None                            # 独立审查 Agent 的意见
     resumed_steps: int = 0                                        # 从存档恢复、没有重新执行的步骤数
+    knowledge: list[dict] = field(default_factory=list)           # 检索到的业务知识片段（来源、分数）
 
 
 class DataAnalystAgent:
     def __init__(self, llm: LLM, max_retries: int = 2, timeout: int = 60, max_steps: int = 5,
                  skills: list[Skill] | None = None, reviewer: LLM | None = None,
-                 review: bool = True, checkpoints: CheckpointStore | None = None):
+                 review: bool = True, checkpoints: CheckpointStore | None = None,
+                 knowledge: KnowledgeBase | None = None):
         self.llm = llm
+        self.knowledge = knowledge        # 业务知识库（RAG）：传入后按问题检索相关业务资料
         self.reviewer = reviewer or llm   # 审查员可以换成另一个模型
         self.review = review
         self.checkpoints = checkpoints    # 传入后：每步存盘，失败后同一任务重跑时从断点继续
@@ -99,6 +103,13 @@ class DataAnalystAgent:
         emit("skills", [(s.name, why) for s, why in chosen])
         if preferences:
             emit("preferences", preferences)
+
+        # ②½ 检索业务知识（RAG）：字段含义、公司口径、平台规则、往期结论，和 Skill 一起交给各个角色
+        hits = self.knowledge.search(question) if self.knowledge else []
+        kb_text = render_knowledge(hits)
+        skills_text += kb_text
+        if self.knowledge:
+            emit("knowledge", [h.to_dict() for h in hits])
 
         history_text = _format_history(history)
 
@@ -139,14 +150,15 @@ class DataAnalystAgent:
         report = self._report(question, ptext, results_text, skills_text, history_text, emit)
         known = profile_numbers(prof) + numbers_from_results([s.result for s in steps if s.result])
         known.append(float(len(current_df)))
+        known += knowledge_numbers(hits)          # 引用平台红线、往期数字也算有出处
         report, unverified, review = check_and_review(
-            report, known, question, review_context(ptext, results_text), self.llm,
+            report, known, question, review_context(ptext, results_text, knowledge_text=kb_text), self.llm,
             self.reviewer if self.review else None, emit)
         if store:
             store.clear(tid)                    # 任务完成，删除存档
         return RunResult(question, prof, plan, steps, report, unverified, log,
                          round(time.time() - t0, 1), [(s.name, why) for s, why in chosen],
-                         review=review, resumed_steps=resumed)
+                         review=review, resumed_steps=resumed, knowledge=[h.to_dict() for h in hits])
 
     @staticmethod
     def _after_step(rec: StepRecord, current_df, data_note, emit):
@@ -244,15 +256,19 @@ def format_results(steps: list[StepRecord]) -> str:
     return "\n\n".join(parts) or "（没有成功的计算步骤）"
 
 
-def review_context(ptext: str, results_text: str, tool_outputs: list[str] | None = None) -> str:
-    """交给审查员的“事实依据”：数据概况 + 计算结果（+ 工具模式下只读工具的返回）。
+def review_context(ptext: str, results_text: str, tool_outputs: list[str] | None = None,
+                   knowledge_text: str = "") -> str:
+    """交给审查员的“事实依据”：数据概况 + 计算结果（+ 工具模式下只读工具的返回）（+ 检索到的业务知识）。
 
     数据概况和只读工具的结果都是程序算的，同样是真实数字。只给审查员看计算步骤时，
     它会把直接引用概况的正确报告误判成“编造”（见调优记录：升级 3 的 C11）。
+    业务知识同理：报告引用平台红线、往期结论是有依据的，审查员看不到就会误判。
     """
     parts = [f"### 数据概况（程序统计，真实）\n{ptext}", results_text]
     if tool_outputs:
         parts.append("### 只读工具返回的结果（程序统计，真实）\n" + "\n\n".join(tool_outputs))
+    if knowledge_text:
+        parts.append(knowledge_text.strip())
     return "\n\n".join(parts)
 
 

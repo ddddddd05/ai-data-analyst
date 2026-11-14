@@ -49,6 +49,13 @@ def chk_no_failed_steps(run, flag):
     return (not failed) if flag else True, ("全部步骤成功" if not failed else f"失败：{'、'.join(failed)}")
 
 
+def chk_knowledge_include(run, groups):
+    """groups：[[A, B], [C]] 表示检索到的业务知识里有（A 或 B）并且有 C。"""
+    got = [k["title"] for k in run.knowledge]
+    misses = [" / ".join(g) for g in groups if not any(t in got for t in g)]
+    return not misses, (f"检索到 {len(got)} 段" if not misses else f"没检索到：{'；'.join(misses)}（实际：{got or '无'}）")
+
+
 def chk_max_steps(run, n):
     return len(run.steps) <= n, f"共 {len(run.steps)} 步（上限 {n}）"
 
@@ -66,6 +73,15 @@ def chk_report_contains(run, groups):
     """groups：[[A, B], [C]] 表示（A 或 B）并且 C。"""
     misses = [" / ".join(g) for g in groups if not any(w in run.report for w in g)]
     return not misses, "报告包含要求的内容" if not misses else "报告缺少：" + "；".join(misses)
+
+
+def chk_report_has_value(run, values):
+    """values：["8.1%", "6%"]。数字前后不能紧挨着别的数字或小数点：
+    只查字面的话，“68.18”里会找到“8.1”、“7.16%”里会找到“6%”（对照实验里真的发生过）。"""
+    import re
+    misses = [v for v in values
+              if not re.search(r"(?<![\d.])" + re.escape(v).replace("%", r"\s*%") + r"(?![\d])", run.report)]
+    return not misses, "报告包含要求的数字" if not misses else "报告缺少数字：" + "、".join(misses)
 
 
 NEGATIONS = ("未做", "未设计", "不做", "不设计", "不设", "未设", "没有做", "没有设计", "不使用", "未使用", "不打", "不采用", "避免")
@@ -107,8 +123,10 @@ CHECKS = {
     "skills_include": ("加载 Skill", chk_skills_include),
     "no_failed_steps": ("步骤成功", chk_no_failed_steps),
     "max_steps": ("步数", chk_max_steps),
+    "knowledge_include": ("知识检索", chk_knowledge_include),
     "result_has_number": ("数字正确", chk_result_has_number),
     "report_contains": ("报告内容", chk_report_contains),
+    "report_has_value": ("报告数字", chk_report_has_value),
     "report_not_contains": ("禁止内容", chk_report_not_contains),
     "max_unverified": ("数字出处", chk_max_unverified),
     "max_seconds": ("速度", chk_max_seconds),
@@ -205,6 +223,7 @@ def main() -> None:
     ap.add_argument("--label", default="评测", help="这次评测的名字")
     ap.add_argument("--mode", choices=["plan", "tools", "mcp"], default="plan",
                     help="plan：规划-执行模式；tools：工具调用模式；mcp：工具调用模式，但工具经 MCP 服务器调用")
+    ap.add_argument("--no-knowledge", action="store_true", help="不接业务知识库（对照实验用）")
     args = ap.parse_args()
 
     spec = json.loads(CASES.read_text(encoding="utf-8"))
@@ -216,12 +235,14 @@ def main() -> None:
     from analyst.config import get_reviewer_config
     rcfg = get_reviewer_config(cfg)
     reviewer = OpenAICompatLLM(rcfg) if rcfg else None
+    from analyst.knowledge import default_knowledge
+    kb = None if args.no_knowledge else default_knowledge()
     if args.mode in ("tools", "mcp"):
         from analyst.tool_agent import ToolCallingAgent
         agent = ToolCallingAgent(OpenAICompatLLM(cfg), reviewer=reviewer,
-                                 tool_source="mcp" if args.mode == "mcp" else "builtin")
+                                 tool_source="mcp" if args.mode == "mcp" else "builtin", knowledge=kb)
     else:
-        agent = DataAnalystAgent(OpenAICompatLLM(cfg), reviewer=reviewer)
+        agent = DataAnalystAgent(OpenAICompatLLM(cfg), reviewer=reviewer, knowledge=kb)
 
     results = evaluate(agent, df, cases)
     OUT_DIR.mkdir(parents=True, exist_ok=True)

@@ -38,8 +38,9 @@ class ToolCallingAgent:
     def __init__(self, llm: ToolLLM, max_tool_calls: int = 15, timeout: int = 60,
                  skills: list[Skill] | None = None, allowed_levels: set[str] | None = None,
                  reviewer=None, review: bool = True, checkpoints: CheckpointStore | None = None,
-                 tool_source: str = "builtin", mcp_specs=None):
+                 tool_source: str = "builtin", mcp_specs=None, knowledge=None):
         self.llm = llm
+        self.knowledge = knowledge        # 业务知识库：传入后工具箱里多一个 search_knowledge 工具
         # 工具来源：builtin = 内置工具箱（tools.py）；mcp = 通过 MCP 协议连接 mcp_servers.json 里的服务器
         self.tool_source = tool_source
         self.mcp_specs = mcp_specs        # 测试时可以直接传入服务器，不读配置文件
@@ -72,7 +73,8 @@ class ToolCallingAgent:
             emit("mcp_connected", {"tools": [n for n in box.tools if n != "submit_report"],
                                    "hidden": box.hidden})
         else:
-            box = ToolBox(df, self.skills, timeout=self.timeout, allowed_levels=self.allowed_levels)
+            box = ToolBox(df, self.skills, timeout=self.timeout, allowed_levels=self.allowed_levels,
+                          knowledge=self.knowledge)
         try:
             return self._loop(df, question, emit, log, t0, prof, ptext, box, history, preferences)
         finally:
@@ -181,7 +183,8 @@ class ToolCallingAgent:
                          round(time.time() - t0, 1),
                          [(n, "模型调用 load_skill 加载") for n in box.loaded_skills],
                          mode="mcp" if self.tool_source == "mcp" else "tools", tool_calls=trace,
-                         review=review, resumed_steps=resumed)
+                         review=review, resumed_steps=resumed,
+                         knowledge=list(getattr(box, "kb_hits", [])))
 
     @staticmethod
     def _record_step(open_step, steps, args, out, rows, rows_after, emit) -> StepRecord | None:
