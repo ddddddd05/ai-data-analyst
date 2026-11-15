@@ -22,10 +22,10 @@ from typing import Callable
 
 import pandas as pd
 
-from . import prompts
+from . import prompts, usage
 from .checkpoint import CheckpointStore, task_id
 from .agent import (RunResult, StepRecord, _brief, _format_history, check_and_review, format_results,
-                    review_context)
+                    review_context, run_tracked)
 from .llm import ToolLLM
 from .memory import render_preferences
 from .profiler import profile, profile_numbers, profile_to_text
@@ -38,8 +38,11 @@ class ToolCallingAgent:
     def __init__(self, llm: ToolLLM, max_tool_calls: int = 15, timeout: int = 60,
                  skills: list[Skill] | None = None, allowed_levels: set[str] | None = None,
                  reviewer=None, review: bool = True, checkpoints: CheckpointStore | None = None,
-                 tool_source: str = "builtin", mcp_specs=None, knowledge=None):
+                 tool_source: str = "builtin", mcp_specs=None, knowledge=None, db=None):
         self.llm = llm
+        self.db = db                      # 传入数据库（analyst.database.Database）：工具换成查表结构、执行只读 SQL
+        if db is not None and tool_source == "mcp":
+            raise ValueError("数据库模式暂不支持经 MCP 调用工具")
         self.knowledge = knowledge        # 业务知识库：传入后工具箱里多一个 search_knowledge 工具
         # 工具来源：builtin = 内置工具箱（tools.py）；mcp = 通过 MCP 协议连接 mcp_servers.json 里的服务器
         self.tool_source = tool_source
@@ -52,10 +55,13 @@ class ToolCallingAgent:
         self.skills = load_skills() if skills is None else skills
         self.allowed_levels = allowed_levels
 
-    def run(self, df: pd.DataFrame, question: str,
+    def run(self, df: pd.DataFrame | None, question: str,
             on_event: Callable[[str, object], None] | None = None,
             history: list[tuple[str, str]] | str | None = None,
             preferences: list[str] | None = None) -> RunResult:
+        return run_tracked(self._run, df, question, on_event, history, preferences)
+
+    def _run(self, df, question, on_event, history, preferences) -> RunResult:
         t0 = time.time()
         log: list[dict] = []
 
@@ -64,10 +70,18 @@ class ToolCallingAgent:
             if on_event:
                 on_event(kind, payload)
 
-        prof = profile(df)
-        ptext = profile_to_text(prof, df)
+        if self.db is not None:
+            prof = self.db.profile()
+            ptext = f"数据库 {self.db.name}（只读），共 {len(self.db.tables)} 张表：\n{self.db.overview()}"
+            df = self.db                      # 任务存档用数据库文件的指纹区分数据
+        else:
+            prof = profile(df)
+            ptext = profile_to_text(prof, df)
         emit("profile", ptext)
-        if self.tool_source == "mcp":
+        if self.db is not None:
+            box = ToolBox(None, [], timeout=self.timeout, allowed_levels=self.allowed_levels,
+                          knowledge=self.knowledge, db=self.db)
+        elif self.tool_source == "mcp":
             from .mcp_client import MCPToolBox
             box = MCPToolBox(df, self.mcp_specs)
             emit("mcp_connected", {"tools": [n for n in box.tools if n != "submit_report"],
@@ -82,8 +96,11 @@ class ToolCallingAgent:
 
     def _loop(self, df, question, emit, log, t0, prof, ptext, box, history, preferences) -> RunResult:
         skill_list = "\n".join(f"- {s.name}：{s.description}" for s in self.skills) or "（无）"
+        if self.db is not None:
+            skill_list = "（数据库模式不使用 Skill，指标口径用 list_tables 查看）"
+        system = prompts.DB_TOOL_AGENT_SYSTEM if self.db is not None else prompts.TOOL_AGENT_SYSTEM
         messages = [
-            {"role": "system", "content": prompts.TOOL_AGENT_SYSTEM},
+            {"role": "system", "content": system},
             {"role": "user", "content": prompts.TOOL_AGENT_USER.format(
                 history=_format_history(history), question=question, profile=ptext,
                 skill_list=skill_list) + render_preferences(preferences)},
@@ -120,7 +137,8 @@ class ToolCallingAgent:
 
         # 循环次数也设上限：防止模型一直只回文字、不调工具
         for _ in range(self.max_tool_calls + 3):
-            reply = self.llm.chat_tools(messages, box.schemas())
+            with usage.stage("工具循环"):
+                reply = self.llm.chat_tools(messages, box.schemas())
             messages.append(reply["raw"])
             if not reply["tool_calls"]:
                 if len(reply["content"]) > 80 or nudged:   # 模型直接写了报告
@@ -155,7 +173,7 @@ class ToolCallingAgent:
 
                 if name == "load_skill" and out.ok:
                     emit("skills", [(args.get("name"), "模型调用 load_skill 加载")])
-                elif name == "run_python" and out.exec_result is not None:
+                elif name in ("run_python", "run_sql") and out.exec_result is not None:
                     open_step = self._record_step(open_step, steps, args, out, rows_before,
                                                    box.rows, emit)
                 elif name == "submit_report" and out.ok and level == FINISH:
@@ -167,11 +185,14 @@ class ToolCallingAgent:
                 emit("tool_limit", self.max_tool_calls)
                 messages.append({"role": "user", "content": prompts.TOOL_LIMIT_REACHED.format(
                     limit=self.max_tool_calls)})
-                report = self.llm.chat_tools(messages, [])["content"]
+                with usage.stage("写报告"):
+                    report = self.llm.chat_tools(messages, [])["content"]
                 break
 
         known = profile_numbers(prof) + numbers_from_results([s.result for s in steps if s.result])
         known += extra_numbers + [float(box.rows)]
+        if self.db is not None:
+            known += self.db.numbers()
         report, unverified, review = check_and_review(
             report.strip(), known, question,
             review_context(ptext, format_results(steps), read_outputs), self.llm,
@@ -182,7 +203,8 @@ class ToolCallingAgent:
         return RunResult(question, prof, plan, steps, report.strip(), unverified, log,
                          round(time.time() - t0, 1),
                          [(n, "模型调用 load_skill 加载") for n in box.loaded_skills],
-                         mode="mcp" if self.tool_source == "mcp" else "tools", tool_calls=trace,
+                         mode="mcp" if self.tool_source == "mcp" else ("sql-tools" if self.db else "tools"),
+                         tool_calls=trace,
                          review=review, resumed_steps=resumed,
                          knowledge=list(getattr(box, "kb_hits", [])))
 
@@ -190,12 +212,14 @@ class ToolCallingAgent:
     def _record_step(open_step, steps, args, out, rows, rows_after, emit) -> StepRecord | None:
         """把 run_python 调用整理成“步骤”，失败后紧接着的重试算同一步（和规划模式的重试对齐）。"""
         rec = open_step
-        if rec is None:
+        tool = "run_sql" if "sql" in args else "run_python"
+        if rec is None or rec.method != f"工具模式：{tool}":     # 换了工具就算新的一步
             rec = StepRecord(id=len(steps) + 1, goal=str(args.get("purpose", "") or "运行代码"),
-                             method="工具模式：run_python")
+                             method=f"工具模式：{tool}")
             steps.append(rec)
         rec.attempts += 1
-        rec.code, rec.result, rec.data_rows = str(args.get("code", "")), out.exec_result, rows
+        rec.code, rec.result = str(args.get("code") or args.get("sql") or ""), out.exec_result
+        rec.data_rows = len(out.exec_result.tables.get("查询结果", [])) if tool == "run_sql" else rows
         if out.ok:
             rec.warnings = check_step(out.exec_result)
             emit("step_done", rec)

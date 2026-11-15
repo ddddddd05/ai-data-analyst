@@ -64,7 +64,9 @@ def chk_result_has_number(run, items):
     nums = _all_numbers(run)
     misses = []
     for it in items:
-        if not any(abs(x - v) <= it.get("tol", 0) + 1e-9 for v in it["values"] for x in nums):
+        # tol：绝对误差；rel：相对误差（数据库评测的参考答案是实时算的，Agent 四舍五入后会有一点差别）
+        if not any(abs(x - v) <= it.get("tol", 0) + abs(v) * it.get("rel", 0) + 1e-9
+                   for v in it["values"] for x in nums):
             misses.append(f"{it['label']}（应为 {it['values'][0]}）")
     return not misses, "计算结果正确" if not misses else "计算结果里找不到：" + "；".join(misses)
 
@@ -75,12 +77,17 @@ def chk_report_contains(run, groups):
     return not misses, "报告包含要求的内容" if not misses else "报告缺少：" + "；".join(misses)
 
 
+def _value_pattern(v: str) -> str:
+    num, unit = re.match(r"([\d.]+)(.*)", v).groups()
+    zeros = "0*" if "." in num else r"(?:\.0+)?"
+    return r"(?<![\d.])" + re.escape(num) + zeros + r"(?![\d])" + re.escape(unit).replace("%", r"\s*%")
+
+
 def chk_report_has_value(run, values):
     """values：["8.1%", "6%"]。数字前后不能紧挨着别的数字或小数点：
-    只查字面的话，“68.18”里会找到“8.1”、“7.16%”里会找到“6%”（对照实验里真的发生过）。"""
-    import re
-    misses = [v for v in values
-              if not re.search(r"(?<![\d.])" + re.escape(v).replace("%", r"\s*%") + r"(?![\d])", run.report)]
+    只查字面的话，“68.18”里会找到“8.1”、“7.16%”里会找到“6%”（对照实验里真的发生过）。
+    小数末尾补零也算：“8.10%”就是 8.1%（缓存优化那轮 C17 因此被误判）。"""
+    misses = [v for v in values if not re.search(_value_pattern(v), run.report)]
     return not misses, "报告包含要求的数字" if not misses else "报告缺少数字：" + "、".join(misses)
 
 
@@ -144,6 +151,7 @@ def grade(case: dict, run: RunResult) -> dict:
             "passed": all(d["ok"] for d in details), "checks": details,
             "seconds": run.seconds, "steps": len(run.steps),
             "skills": [n for n, _ in run.skills], "unverified": run.unverified,
+            "usage": run.usage,
             # 失败步骤的最后一次报错，方便分析 badcase
             "step_errors": {f"第{s.id}步": (s.errors or ["无结果"])[-1][-500:] for s in run.steps if not s.ok}}
 
@@ -182,6 +190,49 @@ def evaluate(agent, df, cases: list[dict], log=print) -> list[dict]:
     return results
 
 
+def usage_lines(results: list[dict]) -> tuple[list[str], list[str]]:
+    """成本统计：(放在报告开头的一行汇总, “成本分布”一节)。两个评测脚本共用。"""
+    us = [r.get("usage") or {} for r in results if (r.get("usage") or {}).get("calls")]
+    if not us:
+        return [], []
+    n = len(us)
+    prompt = sum(u["prompt_tokens"] for u in us)
+    cached = sum(u["cached_tokens"] for u in us)
+    costs = [u.get("cost") for u in us]
+    cur = us[0].get("currency", "")
+    has_cost = None not in costs
+    head = [f"- 平均每题：模型调用 {sum(u['calls'] for u in us) / n:.1f} 次，输入 {prompt / n:,.0f} tokens"
+            f"（缓存命中 {cached / max(prompt, 1):.0%}），输出 {sum(u['completion_tokens'] for u in us) / n:,.0f} tokens，"
+            f"模型耗时 {sum(u['llm_seconds'] for u in us) / n:.1f} 秒"
+            + (f"，费用约 {sum(costs) / n:.4f} {cur}（全部 {n} 题共 {sum(costs):.4f} {cur}）" if has_cost else "")]
+    stages: dict[str, dict] = {}
+    for u in us:
+        for s in u["by_stage"]:
+            a = stages.setdefault(s["stage"], {"calls": 0, "prompt": 0, "out": 0, "cost": 0.0, "sec": 0.0})
+            a["calls"] += s["calls"]
+            a["prompt"] += s["prompt_tokens"]
+            a["out"] += s["completion_tokens"]
+            a["sec"] += s["seconds"]
+            a["cost"] += s["cost"] or 0.0
+    total_cost = sum(a["cost"] for a in stages.values()) or 1
+    total_tok = sum(a["prompt"] + a["out"] for a in stages.values()) or 1
+    body = ["", "## 成本分布（按环节，全部题目合计）", "",
+            "| 环节 | 调用次数 | 输入 tokens | 输出 tokens | 模型耗时 | " + ("费用 | 费用占比 |" if has_cost else "token 占比 |"),
+            "|---|---|---|---|---|" + ("---|---|" if has_cost else "---|")]
+    for name, a in sorted(stages.items(), key=lambda kv: -(kv[1]["prompt"] + kv[1]["out"])):
+        share = (f"{a['cost']:.4f} | {a['cost'] / total_cost:.0%} |" if has_cost
+                 else f"{(a['prompt'] + a['out']) / total_tok:.0%} |")
+        body.append(f"| {name} | {a['calls']} | {a['prompt']:,} | {a['out']:,} | {a['sec']:.1f} 秒 | {share}")
+    return head, body
+
+
+def _cost_cell(r: dict) -> str:
+    u = r.get("usage") or {}
+    if not u.get("calls"):
+        return "—"
+    return f"{u['cost']:.4f}" if u.get("cost") is not None else f"{u['prompt_tokens'] + u['completion_tokens']:,} tok"
+
+
 def to_markdown(results: list[dict], label: str, model: str) -> str:
     n, ok = len(results), sum(r["passed"] for r in results)
     lines = [f"# 评测报告：{label}", "",
@@ -190,17 +241,20 @@ def to_markdown(results: list[dict], label: str, model: str) -> str:
              f"- **通过：{ok} / {n}**",
              f"- 平均用时：{sum(r['seconds'] for r in results) / max(n, 1):.1f} 秒",
              f"- 独立审查：发现严重矛盾并修改报告 {sum(1 for r in results if r.get('review', {}).get('revised'))} 题，"
-             f"只有提醒 {sum(1 for r in results if r.get('review', {}).get('issues') and not r['review'].get('revised'))} 题", "",
-             "## 各题结果", "", "| 编号 | 类型 | 问题 | 结果 | 用时 | 没通过的检查 |", "|---|---|---|---|---|---|"]
+             f"只有提醒 {sum(1 for r in results if r.get('review', {}).get('issues') and not r['review'].get('revised'))} 题"]
+    head, cost_section = usage_lines(results)
+    lines += head + ["", "## 各题结果", "", "| 编号 | 类型 | 问题 | 结果 | 用时 | 费用 | 没通过的检查 |",
+                     "|---|---|---|---|---|---|---|"]
     for r in results:
         bad = "；".join(f"{c['check']}：{c['detail']}" for c in r["checks"] if not c["ok"]) or "—"
         lines.append(f"| {r['id']} | {r['category']} | {r['question']} | "
-                     f"{'✅' if r['passed'] else '❌'} | {r['seconds']} 秒 | {bad} |")
+                     f"{'✅' if r['passed'] else '❌'} | {r['seconds']} 秒 | {_cost_cell(r)} | {bad} |")
     by_cat: dict[str, list[bool]] = {}
     for r in results:
         by_cat.setdefault(r["category"], []).append(r["passed"])
     lines += ["", "## 按类型统计", "", "| 类型 | 通过 |", "|---|---|"]
     lines += [f"| {c} | {sum(v)} / {len(v)} |" for c, v in by_cat.items()]
+    lines += cost_section
     fails = [r for r in results if not r["passed"]]
     if fails:
         lines += ["", "## 未通过的题（badcase）", ""]

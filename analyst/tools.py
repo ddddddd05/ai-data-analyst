@@ -3,10 +3,14 @@
 权限等级（越往下越危险，管得越严）：
 | 等级 | 含义 | 工具 |
 |---|---|---|
-| 只读 read | 只看数据，不改任何东西，直接执行 | preview_data、describe_column、load_skill、search_knowledge（配置了知识库时） |
+| 只读 read | 只看数据，不改任何东西，直接执行 | preview_data、describe_column、load_skill、search_knowledge（配置了知识库时）；数据库模式：list_tables、describe_table |
+| 只读查询 query | 数据库模式：执行模型写的 SQL，只读连接 + 授权回调只放行读操作 + 超时 + 行数上限 | run_sql |
 | 执行代码 exec | 运行模型写的 Python，必须先过 sandbox 的静态安全检查，再放进子进程运行 | run_python |
 | 结束 finish | 提交最终报告，结束本轮 | submit_report |
 | 不提供 | 读写文件、联网、执行系统命令——工具箱里根本没有这些工具，模型想调也调不到 | — |
+
+数据库模式（传入 db）：没有 preview_data、describe_column、load_skill（指标口径由语义层提供），
+多了 list_tables、describe_table、run_sql；run_python 的 df 是最近一次 run_sql 的查询结果。
 
 模型“点名”要用某个工具时，由 ToolBox.call 统一检查：工具存不存在、权限等级是否被允许、
 参数对不对，然后才真正执行。所有调用结果都以文字形式返回给模型。
@@ -20,8 +24,8 @@ from .knowledge import KnowledgeBase, knowledge_numbers
 from .sandbox import ExecResult, run_code, static_check
 from .skills import Skill
 
-READ, EXEC, FINISH = "read", "exec", "finish"
-LEVEL_NAMES = {READ: "只读", EXEC: "执行代码", FINISH: "结束"}
+READ, QUERY, EXEC, FINISH = "read", "query", "exec", "finish"
+LEVEL_NAMES = {READ: "只读", QUERY: "只读查询", EXEC: "执行代码", FINISH: "结束"}
 NOT_PROVIDED = ["读写文件", "联网", "执行系统命令"]
 
 
@@ -75,6 +79,23 @@ SEARCH_KNOWLEDGE = Tool(
      "required": ["query"]})
 
 
+DB_TOOLS = [
+    Tool("list_tables", READ, "列出数据库里所有的表（表名、行数、说明）和预定义的指标口径（只读）。",
+         {"type": "object", "properties": {}}),
+    Tool("describe_table", READ, "查看一张表的结构（只读）：列名、类型、中文说明、类别列的取值样例、外键。",
+         {"type": "object", "properties": {"table": {"type": "string", "description": "表名"}},
+          "required": ["table"]}),
+    Tool("run_sql", QUERY,
+         "执行一条 SQLite 查询（只读：只允许 SELECT / WITH，一次一条，超时会中断，最多返回 200 行）。"
+         "在 SQL 里完成 JOIN 和汇总。查询结果会保存为 df，之后的 run_python 可以继续用。",
+         {"type": "object", "properties": {
+             "purpose": {"type": "string", "description": "这条查询要算什么（一句话）"},
+             "sql": {"type": "string", "description": "完整的 SQL"}},
+          "required": ["purpose", "sql"]}),
+]
+DB_HIDDEN = {"preview_data", "describe_column", "load_skill"}
+
+
 @dataclass
 class ToolOutcome:
     ok: bool
@@ -84,13 +105,18 @@ class ToolOutcome:
 
 
 class ToolBox:
-    def __init__(self, df: pd.DataFrame, skills: list[Skill], timeout: int = 60,
-                 allowed_levels: set[str] | None = None, knowledge: KnowledgeBase | None = None):
-        self.df = df
+    def __init__(self, df: pd.DataFrame | None, skills: list[Skill], timeout: int = 60,
+                 allowed_levels: set[str] | None = None, knowledge: KnowledgeBase | None = None,
+                 db=None):
+        self.db = db                                   # analyst.database.Database：数据库模式
+        self.df = df if df is not None else pd.DataFrame()
         self.skills = {s.name: s for s in skills}
         self.timeout = timeout
-        self.allowed = allowed_levels or {READ, EXEC, FINISH}
+        self.allowed = allowed_levels or {READ, QUERY, EXEC, FINISH}
         self.tools = {t.name: t for t in TOOLS}
+        if db is not None:
+            self.tools = {n: t for n, t in self.tools.items() if n not in DB_HIDDEN}
+            self.tools.update({t.name: t for t in DB_TOOLS})
         self.knowledge = knowledge
         if knowledge is not None:                  # 有知识库才把检索工具放进菜单
             self.tools[SEARCH_KNOWLEDGE.name] = SEARCH_KNOWLEDGE
@@ -173,15 +199,49 @@ class ToolBox:
         return ToolOutcome(True, "业务知识库检索结果（模拟的公司资料）：\n\n" + text,
                            numbers=knowledge_numbers(hits))
 
+    # ---------- 数据库：查看表结构、只读查询 ----------
+    def _list_tables(self) -> ToolOutcome:
+        db = self.db
+        metrics = "\n".join(f"- {n}：{m['formula']}" for n, m in db.metrics.items()) or "（无）"
+        return ToolOutcome(True, f"数据库 {db.name} 的表：\n{db.overview()}\n\n指标口径（必须按此计算）：\n{metrics}",
+                           numbers=db.numbers())
+
+    def _describe_table(self, table: str) -> ToolOutcome:
+        if table not in self.db.by_name:
+            return ToolOutcome(False, f"没有表“{table}”。现有的表：{list(self.db.by_name)}")
+        return ToolOutcome(True, self.db.schema_text([table]), numbers=[float(self.db.by_name[table].rows)])
+
+    def _run_sql(self, sql: str, purpose: str = "") -> ToolOutcome:
+        from .sql_agent import EMPTY_RESULT, sql_to_exec
+        res = self.db.run_sql(sql)
+        if not res.ok:
+            text = "查询失败：" + res.error
+            if "no such column" in res.error or "no such table" in res.error:
+                text += f"\n现有的表：{list(self.db.by_name)}，用 describe_table 查看列名。"
+            return ToolOutcome(False, text, ExecResult(ok=False, error=text))
+        if res.df.empty:
+            return ToolOutcome(False, EMPTY_RESULT, ExecResult(ok=False, error=EMPTY_RESULT))
+        self.df = res.df
+        exec_res = sql_to_exec(res, self.db.max_rows)
+        text = (f"查询成功，{exec_res.notes}：\n{res.df.to_string(max_rows=30, index=False)}\n"
+                "（结果已保存为 df，需要继续计算或画图时可以用 run_python）")
+        return ToolOutcome(True, text[:4000], exec_res)
+
     # ---------- 执行代码：必须先过安全检查 ----------
     def _run_python(self, code: str, purpose: str = "") -> ToolOutcome:
+        if self.db is not None and self.df.empty:
+            return ToolOutcome(False, "还没有查询结果：先用 run_sql 查询，run_python 的 df 是最近一次的查询结果。",
+                               ExecResult(ok=False, error="没有查询结果"))
         problems = static_check(code)
         if problems:
             err = "安全检查未通过，代码没有运行：" + "；".join(problems)
             return ToolOutcome(False, err, ExecResult(ok=False, error=err))
         res = run_code(code, self.df, timeout=self.timeout)
         if not res.ok:
-            return ToolOutcome(False, "运行出错：\n" + res.error[-1500:], res)
+            text = "运行出错：\n" + res.error[-1500:]
+            if "KeyError" in res.error:            # 最常见的错误：列名写错（数据库模式下列名是 SQL 里起的别名）
+                text += f"\ndf 现有的列：{list(self.df.columns)}"
+            return ToolOutcome(False, text, res)
         if not res.has_output:
             res.ok = False
             res.error = "代码没有把结果写入 result 字典"

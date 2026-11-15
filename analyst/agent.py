@@ -15,7 +15,7 @@ from typing import Callable
 
 import pandas as pd
 
-from . import prompts
+from . import prompts, usage
 from .checkpoint import CheckpointStore, task_id
 from .knowledge import KnowledgeBase, knowledge_numbers, render_knowledge
 from .llm import LLM, extract_code, extract_json
@@ -60,6 +60,8 @@ class RunResult:
     review: ReviewResult | None = None                            # 独立审查 Agent 的意见
     resumed_steps: int = 0                                        # 从存档恢复、没有重新执行的步骤数
     knowledge: list[dict] = field(default_factory=list)           # 检索到的业务知识片段（来源、分数）
+    usage: dict = field(default_factory=dict)                     # 模型调用的 token、费用、用时（按环节汇总）
+    sql: list[dict] = field(default_factory=list)                 # 数据库模式：用到的表（schema linking）等
 
 
 class DataAnalystAgent:
@@ -84,6 +86,9 @@ class DataAnalystAgent:
             preferences: list[str] | None = None) -> RunResult:
         """history：之前几轮的 [(问题, 结论摘要)]，或记忆模块压缩好的文字（ConversationMemory.render()）。
         preferences：用户的长期偏好，和 Skill 一起放进规划、写代码、写报告的提示词。"""
+        return run_tracked(self._run, df, question, on_event, history, preferences)
+
+    def _run(self, df, question, on_event, history, preferences) -> RunResult:
         t0 = time.time()
         log: list[dict] = []
 
@@ -171,9 +176,11 @@ class DataAnalystAgent:
         return current_df, data_note
 
     # ---------- 规划 ----------
-    def _plan(self, question, ptext, skills_text, history_text, emit) -> list[dict]:
-        reply = self.llm.chat(prompts.PLANNER_SYSTEM, prompts.PLANNER_USER.format(
-            question=question, profile=ptext, skills=skills_text, history=history_text))
+    def _plan(self, question, ptext, skills_text, history_text, emit,
+              system: str = prompts.PLANNER_SYSTEM) -> list[dict]:
+        with usage.stage("规划"):
+            reply = self.llm.chat(system, prompts.PLANNER_USER.format(
+                question=question, profile=ptext, skills=skills_text, history=history_text))
         emit("llm_plan", reply)
         try:
             data = extract_json(reply)
@@ -206,9 +213,10 @@ class DataAnalystAgent:
         rec.data_rows = len(df)
         previous = "\n".join(f"第{s.id}步（{s.goal}）：{s.result.notes if s.ok else '失败'}"
                              for s in done) or "（无）"
-        reply = self.llm.chat(prompts.CODER_SYSTEM, prompts.CODER_USER.format(
-            question=question, step_id=rec.id, goal=rec.goal, method=rec.method,
-            data_note=data_note, profile=ptext, previous=previous, skills=skills_text))
+        with usage.stage("写代码"):
+            reply = self.llm.chat(prompts.CODER_SYSTEM, prompts.CODER_USER.format(
+                question=question, step_id=rec.id, goal=rec.goal, method=rec.method,
+                data_note=data_note, profile=ptext, previous=previous, skills=skills_text))
         code = extract_code(reply)
 
         for attempt in range(1, self.max_retries + 2):
@@ -228,18 +236,32 @@ class DataAnalystAgent:
             emit("step_error", {"step": rec.id, "attempt": attempt, "error": error})
             if attempt > self.max_retries:
                 return
-            reply = self.llm.chat(prompts.CODER_SYSTEM,
-                                  prompts.FIXER_USER.format(code=code, error=error[-1500:]))
+            with usage.stage("修代码"):
+                reply = self.llm.chat(prompts.CODER_SYSTEM,
+                                      prompts.FIXER_USER.format(code=code, error=error[-1500:]))
             code = extract_code(reply)
 
     # ---------- 报告 ----------
     def _report(self, question, ptext, results_text: str, skills_text, history_text,
                 emit) -> str:
-        reply = self.llm.chat(prompts.REPORTER_SYSTEM, prompts.REPORTER_USER.format(
-            question=question, profile=ptext, results=results_text,
-            skills=skills_text, history=history_text))
+        with usage.stage("写报告"):
+            reply = self.llm.chat(prompts.REPORTER_SYSTEM, prompts.REPORTER_USER.format(
+                question=question, profile=ptext, results=results_text,
+                skills=skills_text, history=history_text))
         emit("report", reply)
         return reply.strip()
+
+
+def run_tracked(fn, *args) -> RunResult:
+    """在“账本”里运行一次任务，结束后把用量汇总写进 RunResult.usage（三种 Agent 共用）。
+
+    外面已经开了账本（如后端把识别偏好、记忆压缩也算进同一个问题）就记进那一本。
+    """
+    tracker = usage.current() or usage.UsageTracker()
+    with usage.track(tracker):
+        result = fn(*args)
+    result.usage = tracker.summary()
+    return result
 
 
 def format_results(steps: list[StepRecord]) -> str:
@@ -284,9 +306,11 @@ def check_and_review(report: str, known: list[float], question: str, results_tex
         return report, unverified, None
     emit("review_start", None)
     try:
-        review = review_report(reviewer, question, results_text, report)
+        with usage.stage("审查"):
+            review = review_report(reviewer, question, results_text, report)
         if review.serious:
-            report = revise_report(writer, question, results_text, report, review)
+            with usage.stage("修改报告"):
+                report = revise_report(writer, question, results_text, report, review)
             review.revised = True
             unverified = verify_report_numbers(report, known)
             emit("verify", unverified)

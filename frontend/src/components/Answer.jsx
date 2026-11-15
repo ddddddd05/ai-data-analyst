@@ -24,6 +24,26 @@ function Review({ review }) {
   return <div className="banner ok">🧑‍⚖️ 独立审查通过：结论与计算结果没有发现矛盾。</div>;
 }
 
+// 成本与可观测性：这次提问调用了几次模型、多少 token、多少钱，各环节分别占多少
+function Usage({ usage, seconds }) {
+  if (!usage || !usage.calls) return null;
+  const money = (v) => (v == null ? "—" : `${v.toFixed(4)} ${usage.currency}`);
+  return (
+    <details className="muted small">
+      <summary>
+        💰 模型调用 {usage.calls} 次 · 输入 {usage.prompt_tokens.toLocaleString()} tokens
+        （缓存命中 {(usage.cache_hit_rate * 100).toFixed(0)}%）· 输出 {usage.completion_tokens.toLocaleString()} tokens
+        · {usage.cost == null ? "未配置单价" : `约 ${money(usage.cost)}`} · 模型耗时 {usage.llm_seconds} 秒 / 总耗时 {seconds} 秒
+      </summary>
+      <DataTable
+        columns={["环节", "调用次数", "输入 tokens", "缓存命中", "输出 tokens", "耗时（秒）", "费用"]}
+        rows={usage.by_stage.map((s) => [s.stage, s.calls, s.prompt_tokens, s.cached_tokens, s.completion_tokens,
+          s.seconds, money(s.cost)])}
+      />
+    </details>
+  );
+}
+
 function Step({ step }) {
   return (
     <details className="step">
@@ -46,7 +66,7 @@ function Step({ step }) {
       {step.figures.map((f, i) => <img key={i} src={`data:image/png;base64,${f}`} alt={`图表 ${i + 1}`} />)}
       {step.warnings.map((w, i) => <p key={i} className="banner info small">{w}</p>)}
       <details>
-        <summary className="small">查看代码</summary>
+        <summary className="small">{step.method?.includes("sql") || step.isSql ? "查看 SQL" : "查看代码"}</summary>
         <pre className="code">{step.code}</pre>
       </details>
     </details>
@@ -64,6 +84,9 @@ export default function Answer({ result }) {
           <summary>📚 引用的业务知识（{result.knowledge.length} 段，混合检索）</summary>
           <ul>{result.knowledge.map((k) => <li key={k.title}>{k.title}</li>)}</ul>
         </details>
+      )}
+      {result.sql?.length > 0 && (
+        <p className="muted small">🗂️ 选出的表（schema linking）：{result.sql.map((t) => `${t.table}（${t.reason}）`).join("；")}</p>
       )}
       {result.resumed_steps > 0 && <p className="muted small">💾 从存档恢复了 {result.resumed_steps} 步，没有重做</p>}
       {result.unverified.length > 0 ? (
@@ -96,8 +119,10 @@ export default function Answer({ result }) {
 
       <details>
         <summary>查看分析过程（{result.steps.length} 步，用时 {result.seconds} 秒）</summary>
-        {result.steps.map((s) => <Step key={s.id} step={s} />)}
+        {result.steps.map((s) => <Step key={s.id} step={{ ...s, isSql: result.mode === "sql" }} />)}
       </details>
+
+      <Usage usage={result.usage} seconds={result.seconds} />
 
       <div className="downloads">
         <a href={`/api/runs/${result.run_id}/report.html`}>下载 HTML 报告</a>

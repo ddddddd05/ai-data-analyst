@@ -136,3 +136,56 @@ def test_memory_summary_after_many_turns(make_client):
         result = next(d for k, d in events if k == "result")
     assert result["memory_compressed"] and "钓竿销售额最高" in result["memory_summary"]
     assert client.get(f"/api/sessions/{sid}").json()["compressed_turns"] == 1
+
+
+# ---------- 数据库模式（Text-to-SQL）和成本统计 ----------
+SQL_PLAN = '{"steps": [{"id": 1, "goal": "各品类销售额", "method": "明细关联商品"}]}'
+SQL_CODE = ("```sql\nSELECT p.category AS 品类, ROUND(SUM(oi.unit_price * oi.quantity), 2) AS 销售额 "
+            "FROM order_items oi JOIN products p ON oi.product_id = p.product_id GROUP BY p.category\n```")
+
+
+@pytest.fixture
+def sample_db(tmp_path, monkeypatch):
+    import api.main as main
+    from make_sample_db import build
+    monkeypatch.setattr(main, "SAMPLE_DB", build(tmp_path / "shop.db", n_orders=200))
+
+
+def test_sample_db_and_sql_plan_mode(make_client, sample_db):
+    client, _ = make_client([SQL_PLAN, SQL_CODE, "## 结论\n钓竿销售额最高。", '{"issues": []}'])
+    sid = client.post("/api/sessions").json()["session_id"]
+    info = client.post(f"/api/sessions/{sid}/sample_db").json()
+    assert info["data"] is None and {t["name"] for t in info["database"]["tables"]} >= {"orders", "order_items"}
+    assert any(m["name"] == "ROAS" for m in info["database"]["metrics"])
+    events = parse_sse(client.post(f"/api/sessions/{sid}/ask",
+                                   json={"question": "各品类的销售额是多少？", "mode": "plan"}).text)
+    assert any("选出相关的表" in d["text"] for k, d in events if k == "progress")
+    result = next(d for k, d in events if k == "result")
+    assert result["mode"] == "sql" and {t["table"] for t in result["sql"]} == {"order_items", "products"}
+    assert result["steps"][0]["code"].startswith("SELECT")
+    # 成本：规划、写 SQL、写报告、审查各 1 次（没有“记住”等词不识别偏好；第 1 轮不压缩记忆）
+    assert result["usage"]["calls"] == 4 and result["usage"]["prompt_tokens"] > 0
+    rid = result["run_id"]
+    assert "模型调用 4 次" in client.get(f"/api/runs/{rid}/report.html").text
+    assert json.loads(client.get(f"/api/runs/{rid}/log.json").text)["usage"]["calls"] == 4
+
+
+def test_db_mode_rejects_mcp(make_client, sample_db):
+    client, _ = make_client([])
+    sid = client.post("/api/sessions").json()["session_id"]
+    client.post(f"/api/sessions/{sid}/sample_db")
+    assert client.post(f"/api/sessions/{sid}/ask", json={"question": "x", "mode": "mcp"}).status_code == 400
+
+
+def test_upload_sqlite_and_reject_fake_db(make_client, tmp_path, monkeypatch):
+    import api.main as main
+    from make_sample_db import build
+    monkeypatch.setattr(main, "UPLOAD_DIR", tmp_path / "uploads")
+    client, _ = make_client([])
+    sid = client.post("/api/sessions").json()["session_id"]
+    content = build(tmp_path / "up.db", n_orders=50).read_bytes()
+    info = client.post(f"/api/sessions/{sid}/upload",
+                       files={"file": ("shop.db", io.BytesIO(content), "application/octet-stream")}).json()
+    assert info["data_name"] == "shop.db" and len(info["database"]["tables"]) == 5
+    bad = client.post(f"/api/sessions/{sid}/upload", files={"file": ("x.db", io.BytesIO(b"not sqlite"), "x")})
+    assert bad.status_code == 400

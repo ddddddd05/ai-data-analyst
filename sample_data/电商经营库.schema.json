@@ -1,0 +1,240 @@
+{
+  "tables": {
+    "shops": {
+      "desc": "店铺信息：店铺名称、店铺类型、开店日期",
+      "columns": {
+        "shop_id": "店铺编号",
+        "shop_name": "店铺名称",
+        "shop_type": "店铺类型：自营旗舰店、授权专营店、新开店铺",
+        "open_date": "开店日期 YYYY-MM-DD"
+      }
+    },
+    "products": {
+      "desc": "商品信息：商品名称、所属品类、标价",
+      "columns": {
+        "product_id": "商品编号",
+        "product_name": "商品名称",
+        "category": "品类：钓竿、渔轮、鱼线、鱼饵、配件",
+        "list_price": "标价（美元），不是成交价，计算销售额要用 order_items.unit_price"
+      }
+    },
+    "orders": {
+      "desc": "订单：一个订单一行，记录下单日期、所属店铺、收货地区。一个订单可能包含多件商品，明细在 order_items",
+      "columns": {
+        "order_id": "订单号",
+        "order_date": "下单日期 YYYY-MM-DD，按月汇总用 strftime('%Y-%m', order_date)",
+        "shop_id": "订单所属店铺",
+        "region": "收货地区（美国的州）"
+      }
+    },
+    "order_items": {
+      "desc": "订单明细：每个订单里的每一件商品，成交单价、数量、是否退货、评分。销售额 = unit_price × quantity；数订单数要用 COUNT(DISTINCT order_id)",
+      "columns": {
+        "item_id": "明细编号",
+        "order_id": "所属订单",
+        "product_id": "商品",
+        "unit_price": "成交单价（美元，折扣后）",
+        "quantity": "购买数量（件数、销量）",
+        "is_returned": "这件商品是否退货：1=退货，0=未退货。退货率按订单计算（订单里有任意一件退货就算退货订单），见指标口径",
+        "rating": "客户评分 1～5 星，未评价为 NULL（计算平均分时排除，AVG 会自动跳过 NULL）"
+      }
+    },
+    "ad_spend": {
+      "desc": "广告花费：按 月份 × 店铺 × 品类 汇总的站内广告费用。和订单关联前要先各自汇总，直接 JOIN 明细会重复计算广告费",
+      "separate": true,
+      "columns": {
+        "month": "月份 YYYY-MM",
+        "shop_id": "店铺",
+        "category": "品类",
+        "spend": "广告花费（美元）"
+      }
+    }
+  },
+  "metrics": {
+    "销售额": {
+      "aliases": [
+        "销售额",
+        "GMV",
+        "营业额",
+        "收入",
+        "卖了多少钱"
+      ],
+      "tables": [
+        "order_items"
+      ],
+      "formula": "SUM(order_items.unit_price * order_items.quantity)，包含已退货的明细"
+    },
+    "净销售额": {
+      "aliases": [
+        "净销售额",
+        "扣除退货",
+        "扣掉退货"
+      ],
+      "tables": [
+        "order_items"
+      ],
+      "formula": "SUM(CASE WHEN is_returned = 0 THEN unit_price * quantity ELSE 0 END)"
+    },
+    "订单数": {
+      "aliases": [
+        "订单数",
+        "订单量",
+        "单量",
+        "多少单"
+      ],
+      "tables": [
+        "orders"
+      ],
+      "formula": "COUNT(DISTINCT order_id)；和明细 JOIN 后不能用 COUNT(*)"
+    },
+    "销量": {
+      "aliases": [
+        "销量",
+        "件数",
+        "卖了多少",
+        "卖得最多"
+      ],
+      "tables": [
+        "order_items"
+      ],
+      "formula": "SUM(order_items.quantity)"
+    },
+    "退货率": {
+      "aliases": [
+        "退货率",
+        "退货",
+        "退款"
+      ],
+      "tables": [
+        "order_items"
+      ],
+      "formula": "按订单计算（公司默认口径）：COUNT(DISTINCT CASE WHEN is_returned = 1 THEN order_id END) * 1.0 / COUNT(DISTINCT order_id)，订单里有任意一件退货就算退货订单；按品类等分组时在组内计算"
+    },
+    "退货明细率": {
+      "aliases": [
+        "退货明细率",
+        "按明细",
+        "按件"
+      ],
+      "tables": [
+        "order_items"
+      ],
+      "formula": "AVG(order_items.is_returned)，退货的明细行数 ÷ 明细行数；只有用户明确要求按明细或按件时才用"
+    },
+    "客单价": {
+      "aliases": [
+        "客单价",
+        "平均订单金额",
+        "每单金额"
+      ],
+      "tables": [
+        "order_items",
+        "orders"
+      ],
+      "formula": "销售额 ÷ COUNT(DISTINCT order_id)"
+    },
+    "平均评分": {
+      "aliases": [
+        "评分",
+        "好评",
+        "差评",
+        "星级",
+        "满意度"
+      ],
+      "tables": [
+        "order_items"
+      ],
+      "formula": "AVG(order_items.rating)，NULL（未评价）不计入"
+    },
+    "广告花费": {
+      "aliases": [
+        "广告花费",
+        "广告费",
+        "推广费",
+        "广告投入"
+      ],
+      "tables": [
+        "ad_spend"
+      ],
+      "formula": "SUM(ad_spend.spend)"
+    },
+    "ROAS": {
+      "aliases": [
+        "ROAS",
+        "投入产出比",
+        "广告回报",
+        "广告效果"
+      ],
+      "tables": [
+        "ad_spend",
+        "order_items"
+      ],
+      "formula": "销售额 ÷ 广告花费。两边先按同一维度（店铺 / 品类 / 月份）分别汇总，再按维度关联；不要把 ad_spend 直接 JOIN 到明细上求和，否则广告费会被重复计算"
+    },
+    "ACOS": {
+      "aliases": [
+        "ACOS",
+        "广告成本占比",
+        "广告占比"
+      ],
+      "tables": [
+        "ad_spend",
+        "order_items"
+      ],
+      "formula": "广告花费 ÷ 销售额，汇总方式同 ROAS"
+    }
+  },
+  "joins": [
+    {
+      "left": "ad_spend.category",
+      "right": "products.category",
+      "note": "按品类名关联，不是外键"
+    }
+  ],
+  "dimensions": {
+    "品类": {
+      "aliases": [
+        "品类",
+        "类目",
+        "类别"
+      ],
+      "column": "products.category"
+    },
+    "商品": {
+      "aliases": [
+        "商品",
+        "产品",
+        "单品",
+        "SKU"
+      ],
+      "column": "products.product_name"
+    },
+    "店铺": {
+      "aliases": [
+        "店铺",
+        "门店"
+      ],
+      "column": "shops.shop_name"
+    },
+    "地区": {
+      "aliases": [
+        "地区",
+        "州",
+        "区域",
+        "收货地"
+      ],
+      "column": "orders.region"
+    },
+    "日期": {
+      "aliases": [
+        "月",
+        "季度",
+        "趋势",
+        "日期",
+        "旺季",
+        "淡季"
+      ],
+      "column": "orders.order_date"
+    }
+  }
+}

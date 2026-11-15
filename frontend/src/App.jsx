@@ -11,6 +11,12 @@ const EXAMPLES = [
   "哪个店铺的广告投入产出比最高？",
   "评分低的订单有什么共同特点？",
 ];
+const DB_EXAMPLES = [
+  "各品类的销售额和退货率分别是多少？",
+  "各店铺的订单数、销售额和客单价是多少？",
+  "哪个店铺的广告投入产出比（ROAS）最高？",
+  "店铺C 在加州卖了多少钓竿？",
+];
 
 export default function App() {
   const [config, setConfig] = useState(null);       // 后端配置：模型名、是否配置了密钥
@@ -56,7 +62,8 @@ export default function App() {
     setBusy(true);
     setProgress([]);
     setMessages((m) => [...m, { role: "user", text: q }]);
-    const mode = settings.mode === "plan" ? "plan" : settings.toolSource === "mcp" ? "mcp" : "tools";
+    const useMcp = settings.toolSource === "mcp" && !info?.database;   // 数据库模式不支持 MCP
+    const mode = settings.mode === "plan" ? "plan" : useMcp ? "mcp" : "tools";
     try {
       await ask(
         sid,
@@ -97,13 +104,14 @@ export default function App() {
     setInfo(await api.clear(sid));
   }
 
-  const ready = config?.ready && info?.data && !busy;
+  const hasData = Boolean(info?.data || info?.database);
+  const ready = config?.ready && hasData && !busy;
 
   return (
     <div className="layout">
       <Sidebar
         config={config} settings={settings} setSettings={setSettings} busy={busy}
-        onClear={clearChat} canClear={messages.length > 0} info={info}
+        onClear={clearChat} canClear={messages.length > 0} info={info} isDb={Boolean(info?.database)}
         prefs={prefs} setPrefs={setPrefs}
       />
       <main className="main">
@@ -115,6 +123,7 @@ export default function App() {
         <DataPanel
           info={info} busy={busy}
           onSample={() => loadData(api.useSample(sid))}
+          onSampleDb={() => loadData(api.useSampleDb(sid))}
           onUpload={(file) => loadData(api.upload(sid, file))}
         />
         {notice && <div className="banner error">{notice}</div>}
@@ -154,10 +163,10 @@ export default function App() {
             </div>
           )}
 
-          {info?.data && messages.length === 0 && !busy && (
+          {hasData && messages.length === 0 && !busy && (
             <div className="examples">
               <p className="muted">试试这些问题：</p>
-              {EXAMPLES.map((q) => (
+              {(info.database ? DB_EXAMPLES : EXAMPLES).map((q) => (
                 <button key={q} disabled={!ready} onClick={() => send(q)}>{q}</button>
               ))}
             </div>
@@ -168,7 +177,7 @@ export default function App() {
         <form className="ask" onSubmit={(e) => { e.preventDefault(); send(input); }}>
           <input
             value={input} onChange={(e) => setInput(e.target.value)} disabled={!ready}
-            placeholder={info?.data ? "输入问题，可以连续追问，例如“那钓竿为什么退货率高？”" : "请先上传数据或使用示例数据"}
+            placeholder={hasData ? "输入问题，可以连续追问，例如“那钓竿为什么退货率高？”" : "请先上传数据或使用示例数据"}
           />
           <button className="primary" type="submit" disabled={!ready || !input.trim()}>发送</button>
         </form>

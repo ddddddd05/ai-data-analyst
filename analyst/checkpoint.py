@@ -25,13 +25,16 @@ from .config import ROOT
 CHECKPOINT_DIR = ROOT / "outputs" / "checkpoints"
 
 
-def data_fingerprint(df: pd.DataFrame) -> str:
-    """数据指纹：行列数 + 每行内容的哈希。数据改了一个格子，指纹就不同。"""
+def data_fingerprint(df) -> str:
+    """数据指纹：行列数 + 每行内容的哈希。数据改了一个格子，指纹就不同。
+    数据库（analyst.database.Database）用数据库文件内容的哈希。"""
+    if hasattr(df, "fingerprint"):
+        return df.fingerprint()
     h = pd.util.hash_pandas_object(df, index=True).values
     return f"{df.shape}-{hashlib.sha1(h.tobytes()).hexdigest()[:16]}"
 
 
-def task_id(mode: str, question: str, df: pd.DataFrame, history: object = None,
+def task_id(mode: str, question: str, df, history: object = None,
             preferences: list[str] | None = None) -> str:
     raw = "|".join([mode, question, data_fingerprint(df), repr(history), repr(preferences)])
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]

@@ -44,8 +44,11 @@ def numbers_from_results(results: list[ExecResult], limit_per_table: int = 2000)
 
 
 def _matches(value: float, decimals: int, known: list[float]) -> bool:
+    """按绝对值比较：报告写“比店铺A 低 0.80”，代码算出的差值是 -0.8，方向由“低/下降”表达。
+    方向写反（结论说反）由独立审查负责，这里只管数字有没有出处。"""
     tol = 0.5 * 10 ** (-decimals) + 1e-9
-    return any(abs(value - k) <= tol or (k and abs(value - k) / abs(k) <= 0.005) for k in known)
+    v = abs(value)
+    return any(abs(v - abs(k)) <= tol or (k and abs(v - abs(k)) / abs(k) <= 0.005) for k in known)
 
 
 def verify_report_numbers(report: str, known: list[float]) -> list[str]:

@@ -58,6 +58,7 @@ def run(run_id: str, r: RunResult) -> dict:
         "review": r.review.to_dict() if r.review else None,
         "tool_calls": plain(r.tool_calls), "resumed_steps": r.resumed_steps,
         "knowledge": plain(r.knowledge),
+        "usage": plain(r.usage), "sql": plain(r.sql),
         "steps": [step(s) for s in r.steps],
     }
 
@@ -81,6 +82,10 @@ def event_text(kind: str, payload) -> str | None:
         if payload["hidden"]:
             text += "；未开放：" + "、".join(payload["hidden"])
         return text
+    if kind == "schema_link":
+        return "🗂️ 选出相关的表：" + "；".join(f"{t}（{why}）" for t, why in payload)
+    if kind == "schema_widen":
+        return f"↻ 第{payload}步用到了没选中的表或列，已把全部表结构交给 AI 修正"
     if kind == "plan_trimmed":
         return f"✂️ 去掉汇总类步骤“{payload}”，改由最后的报告完成"
     if kind == "plan":
@@ -93,7 +98,7 @@ def event_text(kind: str, payload) -> str | None:
         return f"🧹 第{payload['step']}步清洗完成，后续统一使用 {payload['rows']} 行数据"
     if kind == "tool_call":
         a = payload["args"]
-        detail = a.get("purpose") or a.get("name") or a.get("column") or a.get("query") or ""
+        detail = a.get("purpose") or a.get("name") or a.get("column") or a.get("table") or a.get("query") or ""
         return f"🛠️ 第{payload['n']}次调用工具 {payload['name']}（{payload['level']}）{detail}"
     if kind == "tool_result" and not payload["ok"]:
         return f"↻ {payload['name']} 没成功：{payload['text'][:120]}"

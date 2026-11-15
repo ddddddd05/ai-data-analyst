@@ -8,7 +8,8 @@
 | GET  /api/config | 模型名称、是否配置了密钥（不返回密钥本身） |
 | POST /api/sessions | 新建一个对话（会话） |
 | POST /api/sessions/{id}/sample | 加载示例数据 |
-| POST /api/sessions/{id}/upload | 上传 CSV / Excel |
+| POST /api/sessions/{id}/sample_db | 加载示例数据库（多表 SQLite，Text-to-SQL） |
+| POST /api/sessions/{id}/upload | 上传 CSV / Excel，或 SQLite 数据库（.db / .sqlite） |
 | GET  /api/sessions/{id} | 当前数据概况、前 50 行、对话摘要 |
 | POST /api/sessions/{id}/ask | 提问。用 SSE（服务器推送事件）一边分析一边把进度推给前端，最后推送完整结果 |
 | POST /api/sessions/{id}/clear | 清空对话（短期记忆） |
@@ -33,24 +34,30 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from analyst import usage
 from analyst.agent import DataAnalystAgent, RunResult, summarize_for_history
 from analyst.checkpoint import CheckpointStore
 from analyst.config import ROOT, get_llm_config, get_reviewer_config
+from analyst.database import Database
 from analyst.knowledge import default_knowledge
 from analyst.memory import ConversationMemory, PreferenceStore, extract_preferences
 from analyst.profiler import load_table, profile
 from analyst.report import to_html, to_log_json
+from analyst.sql_agent import SQLAnalystAgent
 from analyst.tool_agent import ToolCallingAgent
 
 from . import serialize
 
 SAMPLE = ROOT / "sample_data" / "模拟电商订单.csv"
+SAMPLE_DB = ROOT / "sample_data" / "电商经营库.db"
+UPLOAD_DIR = ROOT / "outputs" / "uploads"
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 
 
 @dataclass
 class Session:
     df: pd.DataFrame | None = None
+    db: Database | None = None                 # 数据库模式（和 df 二选一）
     data_name: str = ""
     memory: ConversationMemory = field(default_factory=lambda: ConversationMemory(keep_recent=3))
     lock: threading.Lock = field(default_factory=threading.Lock)   # 同一个对话一次只跑一个问题
@@ -105,7 +112,15 @@ def create_app(llm_factory=None, reviewer_factory=None, prefs: PreferenceStore |
 
     def session_info(s: Session) -> dict:
         info = {"data_name": s.data_name, "memory_summary": s.memory.summary,
-                "compressed_turns": s.memory.compressed_turns, "data": None}
+                "compressed_turns": s.memory.compressed_turns, "data": None, "database": None}
+        if s.db is not None:
+            info["database"] = {"tables": [{"name": t.name, "rows": t.rows, "desc": t.desc,
+                                            "columns": [{"name": c.name, "type": c.type, "desc": c.desc}
+                                                        for c in t.columns],
+                                            "foreign_keys": [f"{t.name}.{a} → {b}.{c}" for a, b, c in t.foreign_keys]}
+                                           for t in s.db.tables],
+                                "metrics": [{"name": n, "formula": m.get("formula", "")}
+                                            for n, m in s.db.metrics.items()]}
         if s.df is not None:
             p = profile(s.df)
             info["data"] = {"rows": p["rows"], "cols": p["cols"], "duplicate_rows": p["duplicate_rows"],
@@ -135,23 +150,46 @@ def create_app(llm_factory=None, reviewer_factory=None, prefs: PreferenceStore |
     @app.post("/api/sessions/{sid}/sample")
     def use_sample(sid: str):
         s = get_session(sid)
-        s.df, s.data_name, s.memory = load_table(SAMPLE), SAMPLE.name, ConversationMemory(keep_recent=3)
+        s.df, s.db, s.data_name = load_table(SAMPLE), None, SAMPLE.name
+        s.memory = ConversationMemory(keep_recent=3)
+        return session_info(s)
+
+    @app.post("/api/sessions/{sid}/sample_db")
+    def use_sample_db(sid: str):
+        s = get_session(sid)
+        if not SAMPLE_DB.exists():
+            raise HTTPException(400, "示例数据库还没有生成，请先运行 python make_sample_db.py")
+        s.df, s.db, s.data_name = None, Database(SAMPLE_DB), SAMPLE_DB.name
+        s.memory = ConversationMemory(keep_recent=3)
         return session_info(s)
 
     @app.post("/api/sessions/{sid}/upload")
     async def upload(sid: str, file: UploadFile = File(...)):
         s = get_session(sid)
         name = file.filename or "data.csv"
-        if Path(name).suffix.lower() not in (".csv", ".xlsx", ".xls"):
-            raise HTTPException(400, "只支持 .csv / .xlsx / .xls 文件")
+        suffix = Path(name).suffix.lower()
+        if suffix not in (".csv", ".xlsx", ".xls", ".db", ".sqlite", ".sqlite3"):
+            raise HTTPException(400, "只支持 .csv / .xlsx / .xls 文件，或 SQLite 数据库 .db / .sqlite")
         content = await file.read()
         if len(content) > 50 * 1024 * 1024:
             raise HTTPException(400, "文件太大（上限 50MB）")
+        if suffix in (".db", ".sqlite", ".sqlite3"):
+            if not content.startswith(b"SQLite format 3\x00"):
+                raise HTTPException(400, "不是有效的 SQLite 数据库文件")
+            UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            path = UPLOAD_DIR / f"{sid}.db"          # 用会话编号命名，不使用上传的文件名
+            path.write_bytes(content)
+            try:
+                db = Database(path)
+            except Exception as e:  # noqa: BLE001
+                raise HTTPException(400, f"读取数据库失败：{e}") from e
+            s.df, s.db, s.data_name, s.memory = None, db, name, ConversationMemory(keep_recent=3)
+            return session_info(s)
         try:
             df = load_table(io.BytesIO(content), name)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(400, f"读取失败：{e}") from e
-        s.df, s.data_name, s.memory = df, name, ConversationMemory(keep_recent=3)
+        s.df, s.db, s.data_name, s.memory = df, None, name, ConversationMemory(keep_recent=3)
         return session_info(s)
 
     @app.post("/api/sessions/{sid}/clear")
@@ -164,8 +202,10 @@ def create_app(llm_factory=None, reviewer_factory=None, prefs: PreferenceStore |
     @app.post("/api/sessions/{sid}/ask")
     def ask(sid: str, req: AskRequest):
         s = get_session(sid)
-        if s.df is None:
+        if s.df is None and s.db is None:
             raise HTTPException(400, "请先上传数据或使用示例数据")
+        if s.db is not None and req.mode == "mcp":
+            raise HTTPException(400, "数据库模式暂不支持经 MCP 调用工具，请选择“内置”工具来源")
         llm = make_llm()
         if not s.lock.acquire(blocking=False):
             raise HTTPException(409, "上一个问题还在分析中，请稍等")
@@ -175,45 +215,59 @@ def create_app(llm_factory=None, reviewer_factory=None, prefs: PreferenceStore |
             events.put((kind, data))
 
         def work() -> None:
-            """在后台线程里跑 Agent；进度事件放进队列，由下面的生成器推给前端。"""
+            """在后台线程里跑 Agent；进度事件放进队列，由下面的生成器推给前端。
+            整个问题开一本账：识别偏好、分析、记忆压缩的模型调用都算进这次提问的费用。"""
+            tracker = usage.UsageTracker()
             try:
-                question = req.question.strip()
-                new_prefs, has_question = extract_preferences(llm, question)
-                for pf in new_prefs:
-                    store.add(pf["topic"], pf["content"])
-                if new_prefs:
-                    send("preferences_saved", {"items": new_prefs, "analysis": has_question})
-                if new_prefs and not has_question:
-                    return
-                reviewer = make_reviewer()
-                kb = default_knowledge() if req.knowledge else None
-                if req.mode in ("tools", "mcp"):
-                    agent = ToolCallingAgent(llm, max_tool_calls=req.max_tool_calls, reviewer=reviewer,
-                                             review=req.review, checkpoints=ckpt,
-                                             tool_source="mcp" if req.mode == "mcp" else "builtin",
-                                             knowledge=kb)
-                else:
-                    agent = DataAnalystAgent(llm, max_retries=req.max_retries, reviewer=reviewer,
-                                             review=req.review, checkpoints=ckpt, knowledge=kb)
-
-                def on_event(kind, payload):
-                    text = serialize.event_text(kind, payload)
-                    if text:
-                        send("progress", {"text": text})
-
-                run = agent.run(s.df, question, on_event=on_event, history=s.memory.render(),
-                                preferences=store.contents())
-                compressed = s.memory.add_turn(question, summarize_for_history(run), llm=llm)
-                rid = uuid.uuid4().hex[:12]
-                runs[rid] = run
-                send("result", {**serialize.run(rid, run), "memory_compressed": compressed,
-                                "memory_summary": s.memory.summary})
+                with usage.track(tracker):
+                    _work(tracker)
             except Exception as e:  # noqa: BLE001
                 send("error", {"message": f"调用模型失败：{e}",
                                "resumable": True})   # 已完成的步骤已存档，重新提问同一问题会从断点继续
             finally:
                 send("done", None)
                 s.lock.release()
+
+        def _work(tracker: usage.UsageTracker) -> None:
+            question = req.question.strip()
+            with usage.stage("识别偏好"):
+                new_prefs, has_question = extract_preferences(llm, question)
+            for pf in new_prefs:
+                store.add(pf["topic"], pf["content"])
+            if new_prefs:
+                send("preferences_saved", {"items": new_prefs, "analysis": has_question})
+            if new_prefs and not has_question:
+                return
+            reviewer = make_reviewer()
+            kb = default_knowledge() if req.knowledge else None
+
+            def on_event(kind, payload):
+                text = serialize.event_text(kind, payload)
+                if text:
+                    send("progress", {"text": text})
+
+            kwargs = {"on_event": on_event, "history": s.memory.render(), "preferences": store.contents()}
+            if s.db is not None and req.mode == "plan":
+                agent = SQLAnalystAgent(llm, s.db, max_retries=req.max_retries, reviewer=reviewer,
+                                        review=req.review, checkpoints=ckpt, knowledge=kb)
+                run = agent.run(question, **kwargs)
+            elif req.mode in ("tools", "mcp"):
+                agent = ToolCallingAgent(llm, max_tool_calls=req.max_tool_calls, reviewer=reviewer,
+                                         review=req.review, checkpoints=ckpt,
+                                         tool_source="mcp" if req.mode == "mcp" else "builtin",
+                                         knowledge=kb, db=s.db)
+                run = agent.run(s.df, question, **kwargs)
+            else:
+                agent = DataAnalystAgent(llm, max_retries=req.max_retries, reviewer=reviewer,
+                                         review=req.review, checkpoints=ckpt, knowledge=kb)
+                run = agent.run(s.df, question, **kwargs)
+            with usage.stage("记忆压缩"):
+                compressed = s.memory.add_turn(question, summarize_for_history(run), llm=llm)
+            run.usage = tracker.summary()          # 把记忆压缩也算进去
+            rid = uuid.uuid4().hex[:12]
+            runs[rid] = run
+            send("result", {**serialize.run(rid, run), "memory_compressed": compressed,
+                            "memory_summary": s.memory.summary})
 
         threading.Thread(target=work, daemon=True).start()
 

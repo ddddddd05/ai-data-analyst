@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Protocol
 
+from . import usage
 from .config import LLMConfig
 
 
@@ -37,19 +39,23 @@ class OpenAICompatLLM:
         self.temperature = temperature
 
     def chat(self, system: str, user: str) -> str:
+        t0 = time.perf_counter()
         resp = self.client.chat.completions.create(
             model=self.model,
             temperature=self.temperature,
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": user}],
         )
+        usage.record_response(self.model, resp.usage, time.perf_counter() - t0)  # 记账：token、费用、用时
         return resp.choices[0].message.content or ""
 
     def chat_tools(self, messages: list[dict], tools: list[dict]) -> dict:
         """用 OpenAI 兼容接口的 tools 参数，让模型自己决定调用哪个工具。"""
         kwargs = {"tools": tools} if tools else {}
+        t0 = time.perf_counter()
         resp = self.client.chat.completions.create(
             model=self.model, temperature=self.temperature, messages=messages, **kwargs)
+        usage.record_response(self.model, resp.usage, time.perf_counter() - t0)
         msg = resp.choices[0].message
         calls = []
         for tc in msg.tool_calls or []:
@@ -65,6 +71,8 @@ class OpenAICompatLLM:
 class FakeLLM:
     """按顺序返回预先写好的回答，用于离线测试 Agent 的流程。"""
 
+    model = "fake"
+
     def __init__(self, replies: list[str]):
         self.replies = list(replies)
         self.calls: list[tuple[str, str]] = []
@@ -73,7 +81,9 @@ class FakeLLM:
         self.calls.append((system, user))
         if not self.replies:
             raise RuntimeError("FakeLLM 的预设回答用完了")
-        return self.replies.pop(0)
+        reply = self.replies.pop(0)
+        usage.record(self.model, len(system) + len(user), len(reply))   # 假的 token 数：按字数，供测试记账流程
+        return reply
 
     def chat_tools(self, messages: list[dict], tools: list[dict]) -> dict:
         """预设回答可以是字符串（模型直接回复文字）或
@@ -82,6 +92,7 @@ class FakeLLM:
         if not self.replies:
             raise RuntimeError("FakeLLM 的预设回答用完了")
         r = self.replies.pop(0)
+        usage.record(self.model, sum(len(str(m.get("content") or "")) for m in messages), len(str(r)))
         if isinstance(r, str):
             return {"content": r, "tool_calls": [], "raw": {"role": "assistant", "content": r}}
         calls = [{"id": f"call_{len(self.calls)}_{i}", "name": n, "arguments": a}
@@ -109,3 +120,9 @@ def extract_code(text: str) -> str:
     """从模型回答里取出 Python 代码。"""
     m = re.search(r"```(?:python|py)?\s*(.*?)```", text, re.S)
     return (m.group(1) if m else text).strip()
+
+
+def extract_sql(text: str) -> str:
+    """从模型回答里取出 SQL。"""
+    m = re.search(r"```(?:sql|sqlite)?\s*(.*?)```", text, re.S | re.I)
+    return (m.group(1) if m else text).strip().rstrip(";").strip()

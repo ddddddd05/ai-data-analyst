@@ -26,6 +26,7 @@ export const api = {
   newSession: () => request("/api/sessions", { method: "POST" }),
   sessionInfo: (sid) => request(`/api/sessions/${sid}`),
   useSample: (sid) => request(`/api/sessions/${sid}/sample`, { method: "POST" }),
+  useSampleDb: (sid) => request(`/api/sessions/${sid}/sample_db`, { method: "POST" }),
   upload: (sid, file) => {
     const form = new FormData();
     form.append("file", file);

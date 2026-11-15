@@ -2,7 +2,7 @@
 import { useState } from "react";
 import { api } from "../api.js";
 
-export default function Sidebar({ config, settings, setSettings, busy, onClear, canClear, info, prefs, setPrefs }) {
+export default function Sidebar({ config, settings, setSettings, busy, onClear, canClear, info, isDb, prefs, setPrefs }) {
   const set = (key, value) => setSettings((s) => ({ ...s, [key]: value }));
   const [topic, setTopic] = useState("");
   const [content, setContent] = useState("");
@@ -32,6 +32,9 @@ export default function Sidebar({ config, settings, setSettings, busy, onClear, 
         {settings.mode === "plan"
           ? "程序先让模型列计划，再一步步执行：流程固定、稳定。"
           : "模型每一轮自己决定调用哪个工具：更灵活。"}
+        {isDb && (settings.mode === "plan"
+          ? "数据库：程序先选出相关的表（schema linking），每一步写一条 SQL。"
+          : "数据库：模型自己查看表结构、写 SQL。")}
       </p>
 
       {settings.mode === "plan" ? (
@@ -45,13 +48,13 @@ export default function Sidebar({ config, settings, setSettings, busy, onClear, 
             <input type="range" min="5" max="25" value={settings.maxToolCalls} disabled={busy}
               onChange={(e) => set("maxToolCalls", Number(e.target.value))} />
           </label>
-          <div className="radio">
+          {!isDb && <div className="radio">
             <span className="small">工具来源：</span>
             <label><input type="radio" checked={settings.toolSource === "builtin"} disabled={busy}
               onChange={() => set("toolSource", "builtin")} /> 内置</label>
             <label><input type="radio" checked={settings.toolSource === "mcp"} disabled={busy}
               onChange={() => set("toolSource", "mcp")} /> MCP 服务器</label>
-          </div>
+          </div>}
           <p className="muted small">工具权限：只读工具直接执行；运行代码先过安全检查再在独立进程执行；读写文件、联网的工具不提供。</p>
         </>
       )}

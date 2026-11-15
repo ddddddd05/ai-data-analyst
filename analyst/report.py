@@ -51,6 +51,12 @@ def to_html(run: RunResult) -> str:
         items = "、".join(html.escape(x) for x in run.unverified)
         warn = (f'<div class="warn"><b>⚠ 自动校验提醒：</b>报告中这些数字没有在计算结果里找到出处，'
                 f'请人工核对：{items}</div>')
+    cost = ""
+    if run.usage.get("calls"):
+        u = run.usage
+        money = f"，约 {u['cost']:.4f} {u['currency']}" if u.get("cost") is not None else ""
+        cost = (f"<p>模型调用 {u['calls']} 次，输入 {u['prompt_tokens']} tokens（缓存命中 "
+                f"{u['cache_hit_rate']:.0%}），输出 {u['completion_tokens']} tokens{money}。</p>")
     steps_html = []
     for s in run.steps:
         status = "成功" if s.ok else "失败"
@@ -66,7 +72,8 @@ def to_html(run: RunResult) -> str:
             for img in s.result.figures:
                 b64 = base64.b64encode(img).decode()
                 body.append(f'<img src="data:image/png;base64,{b64}">')
-        body.append(f"<details><summary>查看代码</summary><pre>{html.escape(s.code)}</pre></details>")
+        label = "查看 SQL" if "run_sql" in s.method or run.mode == "sql" else "查看代码"
+        body.append(f"<details><summary>{label}</summary><pre>{html.escape(s.code)}</pre></details>")
         steps_html.append("\n".join(body))
     return f"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <title>电商经营分析报告</title>
@@ -81,6 +88,7 @@ img{{max-width:100%}} pre{{background:#f5f5f5;padding:8px;overflow:auto;font-siz
 <p class="q"><b>问题：</b>{html.escape(run.question)}</p>
 <p>数据：{run.profile['rows']} 行 × {run.profile['cols']} 列；用时 {run.seconds} 秒。
 以下内容由 AI 生成，数字经程序核对，结论仍需人工判断。</p>
+{cost}
 {warn}
 {_md_to_html(run.report)}
 <h3>分析过程</h3>
@@ -91,4 +99,5 @@ img{{max-width:100%}} pre{{background:#f5f5f5;padding:8px;overflow:auto;font-siz
 def to_log_json(run: RunResult) -> str:
     return json.dumps({"question": run.question, "mode": run.mode, "plan": run.plan,
                        "tool_calls": run.tool_calls, "unverified": run.unverified,
-                       "seconds": run.seconds, "log": run.log}, ensure_ascii=False, indent=2, default=str)
+                       "seconds": run.seconds, "usage": run.usage, "sql": run.sql, "log": run.log},
+                      ensure_ascii=False, indent=2, default=str)
