@@ -28,7 +28,7 @@ export default function App() {
   const [input, setInput] = useState("");
   const [prefs, setPrefs] = useState([]);
   const [settings, setSettings] = useState({
-    mode: "plan", maxRetries: 2, maxToolCalls: 15, toolSource: "builtin", review: true, knowledge: true,
+    mode: "plan", engine: "handwritten", maxRetries: 2, maxToolCalls: 15, toolSource: "builtin", review: true, knowledge: true,
   });
   const [notice, setNotice] = useState("");
   const bottomRef = useRef(null);
@@ -63,7 +63,8 @@ export default function App() {
     setProgress([]);
     setMessages((m) => [...m, { role: "user", text: q }]);
     const useMcp = settings.toolSource === "mcp" && !info?.database;   // 数据库模式不支持 MCP
-    const mode = settings.mode === "plan" ? "plan" : useMcp ? "mcp" : "tools";
+    const useGraph = settings.engine === "langgraph" && !info?.database;   // LangGraph 版只支持表格
+    const mode = settings.mode === "plan" ? (useGraph ? "graph" : "plan") : useMcp ? "mcp" : "tools";
     try {
       await ask(
         sid,

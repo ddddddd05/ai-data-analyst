@@ -38,10 +38,28 @@ export default function Sidebar({ config, settings, setSettings, busy, onClear, 
       </p>
 
       {settings.mode === "plan" ? (
-        <label className="field">每步最多重试 {settings.maxRetries} 次
-          <input type="range" min="0" max="3" value={settings.maxRetries} disabled={busy}
-            onChange={(e) => set("maxRetries", Number(e.target.value))} />
-        </label>
+        <>
+          {!isDb && (
+            <>
+              <p className="small">流程实现</p>
+              <div className="radio">
+                <label><input type="radio" checked={settings.engine === "handwritten"} disabled={busy}
+                  onChange={() => set("engine", "handwritten")} /> 手写版</label>
+                <label><input type="radio" checked={settings.engine === "langgraph"} disabled={busy}
+                  onChange={() => set("engine", "langgraph")} /> LangGraph</label>
+              </div>
+              <p className="muted small">
+                {settings.engine === "langgraph"
+                  ? "同一套流程画成状态图，由 LangGraph 执行，每个节点后自动存档。"
+                  : "用 for 循环和 if 判断控制流程。"}
+              </p>
+            </>
+          )}
+          <label className="field">每步最多重试 {settings.maxRetries} 次
+            <input type="range" min="0" max="3" value={settings.maxRetries} disabled={busy}
+              onChange={(e) => set("maxRetries", Number(e.target.value))} />
+          </label>
+        </>
       ) : (
         <>
           <label className="field">工具调用上限 {settings.maxToolCalls} 次

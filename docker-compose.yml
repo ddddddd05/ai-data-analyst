@@ -1,0 +1,13 @@
+# 一条命令启动：docker compose up --build
+# 密钥从项目根目录的 .env 读取（不打进镜像）；outputs/ 和 memory/ 挂载到本机，重启容器不丢存档、日志和偏好。
+services:
+  analyst:
+    build: .
+    image: ecommerce-analyst
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - ./outputs:/app/outputs
+      - ./memory:/app/memory
+    restart: unless-stopped

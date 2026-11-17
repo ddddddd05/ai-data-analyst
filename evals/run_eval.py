@@ -275,8 +275,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", nargs="*", help="只跑这些题号")
     ap.add_argument("--label", default="评测", help="这次评测的名字")
-    ap.add_argument("--mode", choices=["plan", "tools", "mcp"], default="plan",
-                    help="plan：规划-执行模式；tools：工具调用模式；mcp：工具调用模式，但工具经 MCP 服务器调用")
+    ap.add_argument("--mode", choices=["plan", "graph", "tools", "mcp"], default="plan",
+                    help="plan：规划-执行模式；graph：规划-执行模式的 LangGraph 版；"
+                         "tools：工具调用模式；mcp：工具调用模式，但工具经 MCP 服务器调用")
     ap.add_argument("--no-knowledge", action="store_true", help="不接业务知识库（对照实验用）")
     args = ap.parse_args()
 
@@ -295,6 +296,9 @@ def main() -> None:
         from analyst.tool_agent import ToolCallingAgent
         agent = ToolCallingAgent(OpenAICompatLLM(cfg), reviewer=reviewer,
                                  tool_source="mcp" if args.mode == "mcp" else "builtin", knowledge=kb)
+    elif args.mode == "graph":
+        from analyst.graph_agent import LangGraphAnalystAgent
+        agent = LangGraphAnalystAgent(OpenAICompatLLM(cfg), reviewer=reviewer, knowledge=kb)
     else:
         agent = DataAnalystAgent(OpenAICompatLLM(cfg), reviewer=reviewer, knowledge=kb)
 

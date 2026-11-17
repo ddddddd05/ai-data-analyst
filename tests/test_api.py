@@ -82,6 +82,29 @@ def test_ask_streams_progress_then_result(make_client):
     assert json.loads(client.get(f"/api/runs/{rid}/log.json").text)["question"] == "各品类销售额？"
 
 
+def test_ask_with_langgraph_mode_and_log(make_client, tmp_path, caplog):
+    client, _ = make_client([PLAN, CODE, "## 结论\n钓竿销售额最高。", '{"issues": []}'])
+    sid = new_session_with_data(client)
+    with caplog.at_level("INFO", logger="analyst"):
+        events = parse_sse(client.post(f"/api/sessions/{sid}/ask",
+                                       json={"question": "各品类销售额？", "mode": "graph"}).text)
+    result = next(d for k, d in events if k == "result")
+    assert result["mode"] == "graph" and result["steps"][0]["ok"]
+    assert (tmp_path / "ckpt" / "langgraph.sqlite").exists()       # 检查点存在测试自己的文件夹里
+    done = next(r for r in caplog.records if r.getMessage() == "ask_done")
+    assert done.fields["mode"] == "graph" and done.fields["steps_ok"] == 1
+    assert done.fields["request"] == next(
+        r for r in caplog.records if r.getMessage() == "ask_start").fields["request"]
+
+
+def test_langgraph_mode_rejects_database(make_client):
+    client, _ = make_client([])
+    sid = client.post("/api/sessions").json()["session_id"]
+    client.post(f"/api/sessions/{sid}/sample_db")
+    resp = client.post(f"/api/sessions/{sid}/ask", json={"question": "x", "mode": "graph"})
+    assert resp.status_code == 400
+
+
 def test_ask_requires_data_and_valid_mode(make_client):
     client, _ = make_client([])
     sid = client.post("/api/sessions").json()["session_id"]

@@ -122,6 +122,30 @@ Agent（analyst/）── 规划-执行 / 工具调用 / 经 MCP 调用
 
 可以只开放部分等级（如 `allowed_levels={"read"}`），没开放的工具不会出现在工具清单里，强行调用也会被拒绝。
 
+### 规划-执行模式的 LangGraph 版
+
+规划-执行模式有两种实现，网页左侧“流程实现”可以切换（目前只支持表格数据）：
+
+- **手写版**（`analyst/agent.py`）：用 for 循环 + if 判断控制流程，自己写存档；
+- **LangGraph 版**（`analyst/graph_agent.py`）：把同一套流程画成状态图，交给 LangGraph 执行。
+
+```
+START → 感知 → 规划 ─┬→ 写代码 → 执行 ─┬→ 收尾本步 ─┐
+                    │         ↑       │（出错且还能重试）
+                    │       修代码 ←──┘             │
+                    └──（还有步骤）←────────────────┘
+                    └──（步骤做完）→ 写报告 → 核对与审查 → END
+```
+
+| | 手写版 | LangGraph 版 |
+|---|---|---|
+| 流程控制 | `for` 循环逐步执行，`for attempt in range(...)` 重试 | 8 个节点（Node）+ 条件边（conditional edge）：“出错回到修代码”“还有步骤继续写代码” |
+| 共享数据 | 局部变量在函数间传来传去 | 状态（State）：节点只读状态、只返回自己改的字段 |
+| 断点续跑 | 自己写 `CheckpointStore`：决定何时存、存什么、怎么还原 | 框架的 `SqliteSaver` 在**每个节点之后**自动存档，中断后传 `None` 从断点继续 |
+| 能看到流程图 | 要读代码 | `get_graph().draw_mermaid()` 直接导出 |
+
+两个版本复用同一批函数（提示词、安全检查、子进程执行、数字核对、独立审查），只有“流程怎么控制”不同。离线测试验证了：**同样的模型回答，两个版本发给模型的每一条消息、步骤结果、报告、事件顺序完全一样**，因此可以用同一套评测题直接对比。
+
 ## 记忆：长对话压缩 + 长期偏好
 
 | | 短期记忆（`ConversationMemory`） | 长期记忆（`PreferenceStore`） |
@@ -379,6 +403,14 @@ python evals/run_eval.py --mode mcp --label 经MCP调用    # 工具调用模式
 
 每次的评测报告保存在 `docs/评测报告/`，分析过程见调优记录。
 
+## 工程化：Docker、CI、运行日志
+
+| | 做了什么 | 为什么 |
+|---|---|---|
+| Docker | `Dockerfile` 两阶段构建（Node 打包前端 → Python 运行环境），非 root 用户运行，带健康检查；`docker-compose.yml` 从 `.env` 读密钥（不打进镜像），`outputs/`、`memory/` 挂载到本机 | 换电脑、部署上线不用重新配环境，一条命令启动 |
+| CI | `.github/workflows/ci.yml`：每次推送或提 PR，GitHub 自动装依赖跑全部离线测试、打包前端、构建 Docker 镜像 | 改坏了代码会立刻显示红叉，不会悄悄合进主分支；离线测试用 FakeLLM，不需要密钥 |
+| 运行日志 | `analyst/logs.py`：每次提问记“开始”和“结束/失败”两条 JSON（同一个请求编号），包含模式、用时、成功步骤、重试次数、未核实数字个数、审查结果、模型调用次数、费用、缓存命中；失败时记完整报错堆栈。写在 `outputs/logs/app.log`，每个 5MB、最多留 5 个 | 线上变慢、变贵、某类问题总失败时，能回头查；只记统计数字，不记报告全文和数据内容 |
+
 ## 项目结构
 
 | 文件 | 作用 | 对应 Agent 要素 |
@@ -390,6 +422,8 @@ python evals/run_eval.py --mode mcp --label 经MCP调用    # 工具调用模式
 | `analyst/profiler.py` | 读取表格、生成数据概况 | 感知 |
 | `analyst/sandbox.py` + `_runner.py` | 静态安全检查、子进程执行代码 | 工具 / 护栏 |
 | `analyst/agent.py` | 规划-执行模式主流程：选 Skill、规划、执行、重试、共用清洗数据、报告、多轮历史 | 循环与记忆 |
+| `analyst/graph_agent.py` | 规划-执行模式的 LangGraph 版：状态、8 个节点、条件边、SQLite 检查点断点续跑 | 循环（框架实现） |
+| `analyst/logs.py` | 运行日志：每次提问的开始/结束/失败，JSON 一行一条，按大小轮转 | 可观测性 |
 | `analyst/tool_agent.py` | 工具调用模式：Agent Loop、调用次数上限、把工具调用整理成步骤 | 循环（模型自主） |
 | `analyst/tools.py` | 工具定义（表格模式 5 个，数据库模式另有 3 个）、权限等级、统一的权限检查入口 | 工具 / 权限 |
 | `analyst/validator.py` | 结果检查、报告数字核对 | 校验兜底 |
@@ -404,7 +438,8 @@ python evals/run_eval.py --mode mcp --label 经MCP调用    # 工具调用模式
 | `analyst/report.py` | 导出 HTML 报告和 JSON 日志 | 可追溯 |
 | `api/main.py` + `api/serialize.py` | 后端（FastAPI）：会话、上传、提问（SSE 流式进度）、偏好、下载 | 接口层 |
 | `frontend/` | 前端（React + Vite）：设置栏、数据区、对话、报告与分析过程 | 界面 |
-| `tests/test_agent.py`、`tests/test_api.py`、`tests/test_knowledge.py`、`tests/test_sql.py` | 128 个离线测试（Agent 65 个 + 后端接口 10 个 + 知识库 15 个 + 数据库与成本统计 38 个） | 测试 |
+| `tests/test_agent.py`、`tests/test_graph.py`、`tests/test_api.py`、`tests/test_knowledge.py`、`tests/test_sql.py` | 138 个离线测试（Agent 65 个 + LangGraph 版 8 个 + 后端接口 12 个 + 知识库 15 个 + 数据库与成本统计 38 个） | 测试 |
+| `Dockerfile`、`docker-compose.yml`、`.github/workflows/ci.yml` | 容器打包、一条命令启动、GitHub 自动测试 | 工程化 |
 | `evals/` | 17 道题的评测集 + 自动打分（含成本统计）；数据库 13 题（执行准确率 + schema linking，含 15 道留出题）；审查员专项评测；任务恢复故障注入评测；知识库检索专项评测 | 评测 |
 | `docs/调优记录.md` | 每次真实运行的问题、原因、改进和效果 | 调优 |
 | `make_sample_data.py` | 生成模拟电商订单数据 | — |
@@ -445,6 +480,14 @@ npm run dev
 ```
 
 打开 http://localhost:5173 ，前端会把 `/api` 开头的请求转发给 8000 端口的后端。
+
+**方式三：Docker（不用装 Python 和 Node）**——配好 `.env` 后：
+
+```bash
+docker compose up --build
+```
+
+打开 http://localhost:8000 。
 
 后端接口文档（FastAPI 自动生成，可以直接在网页上测试每个接口）：http://localhost:8000/docs
 
@@ -488,6 +531,7 @@ python -m pytest -q
 - 业务知识库（`tests/test_knowledge.py`，用假向量模型，不下载模型）：按小节切分、说明行不进正文；专有名词能被关键词找到、无关问题返回空、弱匹配被过滤；混合检索的分数等于两路 RRF 之和；向量缓存生效；向量模型坏了退回关键词；检索结果进入规划、写代码、写报告和审查员的输入；资料里的数字不被当成“找不到出处”；工具模式只有配置了知识库才有 `search_knowledge`、模型能自己调用；MCP 服务器提供该工具；评测的数字检查不会被“68.18 含 8.1”骗过；
 - 后端接口（`tests/test_api.py`）：配置接口不泄露密钥；提问时先推送进度再推送结果，报告和日志可下载；没有数据或参数不合法时拒绝；只说偏好时只保存不分析；上传 CSV 和拒绝其他文件类型；失败时提示可从断点继续；多轮后对话摘要生效；示例数据库 + 规划模式返回选表结果和费用；数据库模式拒绝 MCP；上传 SQLite、拒绝冒充的 .db 文件。
 - 数据库（`tests/test_sql.py`）：DELETE、UPDATE、DROP、多条语句、PRAGMA、ATTACH、INSERT 都被拦；`WITH … DELETE` 骗过静态检查后被授权回调拦下、数据库文件没变；字符串里的分号不误判；死循环查询超时中断；超过行数上限截断；表结构里有中文说明、取值样例、外键；5 类问题选对表；“钓竿”优先选商品表并补上中间表；无关问题给全部表；规划模式端到端、列名写错后附全部表结构修好、结果为空触发修正；任务编号用数据库指纹；工具模式的工具清单和权限、先 SQL 再 Python；
+- LangGraph 版（`tests/test_graph.py`）：图里有 8 个节点和“执行 → 修代码 → 执行”的回环；同样的模型回答和手写版发出的消息、结果、报告、事件顺序完全一样；出错重试、重试用完照样写报告；清洗后的数据交给后续步骤；审查在图里运行；成本按环节记账；断网后从“写代码”节点继续、不重新规划、完成后删除存档；后端选 LangGraph 模式能跑通、检查点存在指定文件夹、日志里开始和结束的请求编号对得上；数据库数据选 LangGraph 模式会被拒绝；
 - 成本统计：按环节汇总、按单价算钱（含缓存价）；没有单价只统计 token；DeepSeek 和 OpenAI 两种缓存字段；没开账本时不记；两个线程的账不串；两种 Agent 的环节顺序正确。
 
 模型的实际效果用真实模型运行评估，记录在调优记录里。

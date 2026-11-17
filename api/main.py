@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import queue
 import threading
 import uuid
@@ -37,9 +38,11 @@ from pydantic import BaseModel, Field
 from analyst import usage
 from analyst.agent import DataAnalystAgent, RunResult, summarize_for_history
 from analyst.checkpoint import CheckpointStore
+from analyst.graph_agent import LangGraphAnalystAgent
 from analyst.config import ROOT, get_llm_config, get_reviewer_config
 from analyst.database import Database
 from analyst.knowledge import default_knowledge
+from analyst.logs import log_event, run_summary, setup_logging
 from analyst.memory import ConversationMemory, PreferenceStore, extract_preferences
 from analyst.profiler import load_table, profile
 from analyst.report import to_html, to_log_json
@@ -65,7 +68,7 @@ class Session:
 
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
-    mode: str = Field("plan", pattern="^(plan|tools|mcp)$")   # plan 规划-执行；tools 工具调用；mcp 工具经 MCP
+    mode: str = Field("plan", pattern="^(plan|graph|tools|mcp)$")   # plan 规划-执行；graph 规划-执行（LangGraph 版）；tools 工具调用；mcp 工具经 MCP
     max_retries: int = Field(2, ge=0, le=3)
     max_tool_calls: int = Field(15, ge=5, le=25)
     review: bool = True
@@ -82,6 +85,7 @@ def create_app(llm_factory=None, reviewer_factory=None, prefs: PreferenceStore |
     """llm_factory 等参数只在测试时传入（用 FakeLLM 代替真实模型）。"""
     app = FastAPI(title="电商经营分析 Agent API",
                   description="上传订单表，用中文提问，Agent 自动清洗、计算、写报告并核对数字。")
+    setup_logging()
     sessions: dict[str, Session] = {}
     runs: dict[str, RunResult] = {}
     store = prefs if prefs is not None else PreferenceStore()
@@ -206,10 +210,13 @@ def create_app(llm_factory=None, reviewer_factory=None, prefs: PreferenceStore |
             raise HTTPException(400, "请先上传数据或使用示例数据")
         if s.db is not None and req.mode == "mcp":
             raise HTTPException(400, "数据库模式暂不支持经 MCP 调用工具，请选择“内置”工具来源")
+        if s.db is not None and req.mode == "graph":
+            raise HTTPException(400, "LangGraph 版目前只支持表格数据，数据库请选择手写版规划-执行")
         llm = make_llm()
         if not s.lock.acquire(blocking=False):
             raise HTTPException(409, "上一个问题还在分析中，请稍等")
         events: queue.Queue = queue.Queue()
+        req_id = uuid.uuid4().hex[:8]          # 每次提问一个编号，日志里“开始”“结束”能对上
 
         def send(kind: str, data) -> None:
             events.put((kind, data))
@@ -218,10 +225,14 @@ def create_app(llm_factory=None, reviewer_factory=None, prefs: PreferenceStore |
             """在后台线程里跑 Agent；进度事件放进队列，由下面的生成器推给前端。
             整个问题开一本账：识别偏好、分析、记忆压缩的模型调用都算进这次提问的费用。"""
             tracker = usage.UsageTracker()
+            log_event("ask_start", session=sid, request=req_id, mode=req.mode,
+                      data="database" if s.db is not None else "table", question=req.question[:200])
             try:
                 with usage.track(tracker):
                     _work(tracker)
             except Exception as e:  # noqa: BLE001
+                log_event("ask_failed", logging.ERROR, exc_info=True, session=sid, request=req_id,
+                          mode=req.mode, error=str(e)[:500], llm_calls=len(tracker.calls))
                 send("error", {"message": f"调用模型失败：{e}",
                                "resumable": True})   # 已完成的步骤已存档，重新提问同一问题会从断点继续
             finally:
@@ -257,6 +268,10 @@ def create_app(llm_factory=None, reviewer_factory=None, prefs: PreferenceStore |
                                          tool_source="mcp" if req.mode == "mcp" else "builtin",
                                          knowledge=kb, db=s.db)
                 run = agent.run(s.df, question, **kwargs)
+            elif req.mode == "graph":
+                agent = LangGraphAnalystAgent(llm, max_retries=req.max_retries, reviewer=reviewer,
+                                              review=req.review, checkpoints=ckpt, knowledge=kb)
+                run = agent.run(s.df, question, **kwargs)
             else:
                 agent = DataAnalystAgent(llm, max_retries=req.max_retries, reviewer=reviewer,
                                          review=req.review, checkpoints=ckpt, knowledge=kb)
@@ -266,6 +281,7 @@ def create_app(llm_factory=None, reviewer_factory=None, prefs: PreferenceStore |
             run.usage = tracker.summary()          # 把记忆压缩也算进去
             rid = uuid.uuid4().hex[:12]
             runs[rid] = run
+            log_event("ask_done", session=sid, request=req_id, run=rid, **run_summary(run))
             send("result", {**serialize.run(rid, run), "memory_compressed": compressed,
                             "memory_summary": s.memory.summary})
 
