@@ -3,7 +3,7 @@
 # 运行：docker compose up（读取 .env 里的 LLM_API_KEY，打开 http://localhost:8000）
 
 # ---------- 阶段 1：打包前端 ----------
-FROM node:20-slim AS frontend
+FROM node:24-slim AS frontend
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
