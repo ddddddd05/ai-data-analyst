@@ -108,6 +108,15 @@ def test_verify_report_numbers():
 # ---------- 解析 ----------
 def test_extract_helpers():
     assert extract_json('好的：```json\n{"steps": [{"id": 1}]}\n```')["steps"][0]["id"] == 1
+    assert extract_json('{"steps": ["清洗", "统计"]}  以上是计划，详见注[1]') == {"steps": ["清洗", "统计"]}
+    assert extract_json('请看下面的分析结果：{"a": 1, "b": [2, 3]}') == {"a": 1, "b": [2, 3]}
+    assert extract_json('```text\n不是JSON\n```\n```json\n{"ok": true}\n```') == {"ok": True}
+    # 引用标号 [1] 在前，也要取到后面真正的对象
+    assert extract_json('根据要求[1]，计划如下：{"steps": [{"goal": "x"}]}') == {"steps": [{"goal": "x"}]}
+    # python 代码块里的字典不算
+    assert extract_json('```python\nd = {"a": 1}\n```\n结果：{"steps": [1]}') == {"steps": [1]}
+    # 顶层就是数组时返回整个数组，而不是数组里的第一个对象
+    assert extract_json('问题如下：[{"claim": "a"}, {"claim": "b"}]') == [{"claim": "a"}, {"claim": "b"}]
     assert extract_code("```python\nprint(1)\n```") == "print(1)"
 
 
@@ -583,7 +592,7 @@ def _mcp_calls(calls, session=None):
             tools = {t.name: t for t in (await c.list_tools()).tools}
             outs = [(await c.call_tool(name, args)).content[0].text for name, args in calls]
             return tools, outs
-    return asyncio.run(go())
+    return asyncio.run(asyncio.wait_for(go(), timeout=30))
 
 
 def test_mcp_lists_tools_with_permission_annotations():
@@ -641,7 +650,7 @@ def test_mcp_server_starts_over_stdio():
             names = [t.name for t in (await c.list_tools()).tools]
             text = (await c.call_tool("list_skills", {})).content[0].text
             return names, text
-    names, text = asyncio.run(go())
+    names, text = asyncio.run(asyncio.wait_for(go(), timeout=30))
     assert "run_python" in names and "数据清洗" in text
 
 

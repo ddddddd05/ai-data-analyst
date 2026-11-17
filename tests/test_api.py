@@ -212,3 +212,27 @@ def test_upload_sqlite_and_reject_fake_db(make_client, tmp_path, monkeypatch):
     assert info["data_name"] == "shop.db" and len(info["database"]["tables"]) == 5
     bad = client.post(f"/api/sessions/{sid}/upload", files={"file": ("x.db", io.BytesIO(b"not sqlite"), "x")})
     assert bad.status_code == 400
+
+
+def test_session_eviction_skips_busy_session(make_client, monkeypatch):
+    """会话超过上限时淘汰最久没用的，但正在分析的会话（锁被占用）不能被淘汰。"""
+    import api.main as main
+    created = []
+    orig = main.Session
+
+    def tracking_session():
+        s = orig()
+        created.append(s)
+        return s
+
+    monkeypatch.setattr(main, "MAX_SESSIONS", 2)
+    monkeypatch.setattr(main, "Session", tracking_session)
+    client, _ = make_client([])
+    busy = client.post("/api/sessions").json()["session_id"]
+    created[0].lock.acquire()                     # 模拟这个会话正在分析
+    idle = client.post("/api/sessions").json()["session_id"]
+    newest = client.post("/api/sessions").json()["session_id"]
+    assert client.get(f"/api/sessions/{busy}").status_code == 200
+    assert client.get(f"/api/sessions/{idle}").status_code == 404
+    assert client.get(f"/api/sessions/{newest}").status_code == 200
+    created[0].lock.release()

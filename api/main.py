@@ -26,6 +26,7 @@ import logging
 import queue
 import threading
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -55,6 +56,8 @@ SAMPLE = ROOT / "sample_data" / "模拟电商订单.csv"
 SAMPLE_DB = ROOT / "sample_data" / "电商经营库.db"
 UPLOAD_DIR = ROOT / "outputs" / "uploads"
 FRONTEND_DIST = ROOT / "frontend" / "dist"
+MAX_SESSIONS = 100
+MAX_RUNS = 200
 
 
 @dataclass
@@ -86,8 +89,9 @@ def create_app(llm_factory=None, reviewer_factory=None, prefs: PreferenceStore |
     app = FastAPI(title="电商经营分析 Agent API",
                   description="上传订单表，用中文提问，Agent 自动清洗、计算、写报告并核对数字。")
     setup_logging()
-    sessions: dict[str, Session] = {}
-    runs: dict[str, RunResult] = {}
+    sessions: OrderedDict[str, Session] = OrderedDict()
+    runs: OrderedDict[str, RunResult] = OrderedDict()
+    state_lock = threading.Lock()
     store = prefs if prefs is not None else PreferenceStore()
     ckpt = checkpoints if checkpoints is not None else CheckpointStore()
 
@@ -110,9 +114,11 @@ def create_app(llm_factory=None, reviewer_factory=None, prefs: PreferenceStore |
         return OpenAICompatLLM(rcfg) if rcfg else None
 
     def get_session(sid: str) -> Session:
-        if sid not in sessions:
-            raise HTTPException(404, "对话不存在（后端可能重启过），请刷新页面")
-        return sessions[sid]
+        with state_lock:
+            if sid not in sessions:
+                raise HTTPException(404, "对话不存在（后端可能重启过），请刷新页面")
+            sessions.move_to_end(sid)
+            return sessions[sid]
 
     def session_info(s: Session) -> dict:
         info = {"data_name": s.data_name, "memory_summary": s.memory.summary,
@@ -144,7 +150,18 @@ def create_app(llm_factory=None, reviewer_factory=None, prefs: PreferenceStore |
     @app.post("/api/sessions")
     def new_session():
         sid = uuid.uuid4().hex[:12]
-        sessions[sid] = Session()
+        with state_lock:
+            sessions[sid] = Session()
+            while len(sessions) > MAX_SESSIONS:
+                # 从最久没用的开始淘汰，但跳过正在分析的会话，免得删掉它正在查的数据库
+                old_sid = next((k for k, v in sessions.items() if not v.lock.locked()), None)
+                if old_sid is None:
+                    break
+                del sessions[old_sid]
+                try:
+                    (UPLOAD_DIR / f"{old_sid}.db").unlink(missing_ok=True)
+                except OSError:      # Windows 上文件正被读取时删不掉，留着不影响新建对话
+                    pass
         return {"session_id": sid}
 
     @app.get("/api/sessions/{sid}")
@@ -280,7 +297,10 @@ def create_app(llm_factory=None, reviewer_factory=None, prefs: PreferenceStore |
                 compressed = s.memory.add_turn(question, summarize_for_history(run), llm=llm)
             run.usage = tracker.summary()          # 把记忆压缩也算进去
             rid = uuid.uuid4().hex[:12]
-            runs[rid] = run
+            with state_lock:
+                runs[rid] = run
+                while len(runs) > MAX_RUNS:
+                    runs.popitem(last=False)
             log_event("ask_done", session=sid, request=req_id, run=rid, **run_summary(run))
             send("result", {**serialize.run(rid, run), "memory_compressed": compressed,
                             "memory_summary": s.memory.summary})
@@ -300,23 +320,25 @@ def create_app(llm_factory=None, reviewer_factory=None, prefs: PreferenceStore |
     # ---------------- 长期偏好 ----------------
     @app.get("/api/preferences")
     def list_prefs():
-        return [p.__dict__ for p in store.items]
+        return store.as_dicts()
 
     @app.post("/api/preferences")
     def add_pref(req: PreferenceRequest):
         store.add(req.topic.strip(), req.content.strip())
-        return [p.__dict__ for p in store.items]
+        return store.as_dicts()
 
     @app.delete("/api/preferences/{topic}")
     def delete_pref(topic: str):
         store.remove(topic)
-        return [p.__dict__ for p in store.items]
+        return store.as_dicts()
 
     # ---------------- 下载 ----------------
     def get_run(rid: str) -> RunResult:
-        if rid not in runs:
-            raise HTTPException(404, "找不到这次分析（后端可能重启过）")
-        return runs[rid]
+        with state_lock:
+            if rid not in runs:
+                raise HTTPException(404, "找不到这次分析（后端可能重启过）")
+            runs.move_to_end(rid)
+            return runs[rid]
 
     @app.get("/api/runs/{rid}/report.html", response_class=HTMLResponse)
     def report_html(rid: str):

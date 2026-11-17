@@ -33,8 +33,8 @@ class OpenAICompatLLM:
 
         # use_proxy=False 时忽略系统/环境变量里的代理设置，直接连接（适合国内模型）
         http_client = None if cfg.use_proxy else DefaultHttpxClient(trust_env=False)
-        self.client = OpenAI(api_key=cfg.api_key, base_url=cfg.base_url, timeout=120,
-                             max_retries=1, http_client=http_client)
+        self.client = OpenAI(api_key=cfg.api_key, base_url=cfg.base_url, timeout=60,
+                             max_retries=3, http_client=http_client)
         self.model = cfg.model
         self.temperature = temperature
 
@@ -106,14 +106,42 @@ class FakeLLM:
 
 
 def extract_json(text: str):
-    """从模型回答里取出 JSON（兼容 ```json 代码块和前后多余文字）。"""
-    m = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
-    candidate = m.group(1) if m else text
-    start = min([i for i in (candidate.find("{"), candidate.find("[")) if i >= 0], default=-1)
-    if start < 0:
-        raise ValueError("回答里没有 JSON")
-    end = max(candidate.rfind("}"), candidate.rfind("]"))
-    return json.loads(candidate[start:end + 1])
+    """从模型回答里取出 JSON（兼容 ```json 代码块和前后多余文字）。
+
+    - 只看 ```json 或没标语言的代码块；```python 等代码块里的字典不算
+    - 同一段文字里有多个 JSON 时优先返回对象 {...}，没有对象才返回数组 [...]，
+      避免“详见[1]”这类引用标号抢在真正的结果前面
+    """
+    blocks = re.findall(r"```([\w+-]*)[ \t]*\n?(.*?)```", text, re.S)
+    json_blocks = [body for lang, body in blocks if lang.lower() in ("", "json")]
+    rest = re.sub(r"```.*?```", " ", text, flags=re.S)      # 去掉所有代码块后的正文
+    for candidate in json_blocks + [rest]:
+        obj = _scan_json(candidate)
+        if obj is not None:
+            return obj
+    raise ValueError("回答里没有 JSON")
+
+
+def _scan_json(text: str):
+    """从左往右找出所有顶层 JSON 值，返回第一个对象；没有对象就返回第一个数组；都没有返回 None。"""
+    decoder = json.JSONDecoder()
+    first_list = None
+    i = 0
+    while i < len(text):
+        if text[i] in "{[":
+            try:
+                obj, end = decoder.raw_decode(text, i)
+            except json.JSONDecodeError:
+                i += 1
+                continue
+            if isinstance(obj, dict):
+                return obj
+            if first_list is None:
+                first_list = obj
+            i = end                  # 跳过整个数组，不把数组里面的元素当成顶层结果
+        else:
+            i += 1
+    return first_list
 
 
 def extract_code(text: str) -> str:

@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -94,6 +95,7 @@ class PreferenceStore:
 
     def __init__(self, path: Path | None = PREF_FILE):
         self.path = path
+        self._lock = threading.RLock()
         self.items: list[Preference] = []
         if path and path.exists():
             try:
@@ -102,22 +104,32 @@ class PreferenceStore:
                 self.items = []
 
     def add(self, topic: str, content: str) -> None:
-        self.items = [p for p in self.items if p.topic != topic]    # 新的覆盖旧的
-        self.items.append(Preference(topic, content, datetime.now().strftime("%Y-%m-%d %H:%M")))
-        self.save()
+        with self._lock:
+            self.items = [p for p in self.items if p.topic != topic]    # 新的覆盖旧的
+            self.items.append(Preference(topic, content, datetime.now().strftime("%Y-%m-%d %H:%M")))
+            self.save()
 
     def remove(self, topic: str) -> None:
-        self.items = [p for p in self.items if p.topic != topic]
-        self.save()
+        with self._lock:
+            self.items = [p for p in self.items if p.topic != topic]
+            self.save()
 
     def save(self) -> None:
-        if self.path:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps([p.__dict__ for p in self.items], ensure_ascii=False, indent=2),
-                                 encoding="utf-8")
+        with self._lock:
+            if self.path:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.path.with_suffix(".tmp")
+                tmp.write_text(json.dumps([p.__dict__ for p in self.items], ensure_ascii=False, indent=2),
+                               encoding="utf-8")
+                tmp.replace(self.path)
+
+    def as_dicts(self) -> list[dict]:
+        with self._lock:
+            return [dict(p.__dict__) for p in self.items]
 
     def contents(self) -> list[str]:
-        return [f"{p.topic}：{p.content}" for p in self.items]
+        with self._lock:
+            return [f"{p.topic}：{p.content}" for p in self.items]
 
 
 def render_preferences(prefs: list[str] | None) -> str:
